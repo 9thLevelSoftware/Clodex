@@ -1,12 +1,20 @@
-# Multi-Agent-Workflow: Kimi Integration for Claude Code v2.0
+# Climi — Multi-Agent Workflow: Kimi K2.5 for Claude Code (v2.0)
 
 [![Kimi CLI](https://img.shields.io/badge/Kimi%20CLI-%E2%89%A51.7.0-blue)]()
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-green)]()
 [![License](https://img.shields.io/badge/License-MIT-yellow)]()
 
+> **Climi** = **C**laude + **Ki**mi. A delegation framework that turns Claude Code into the architect/brain and Kimi K2.5 into the implementer/hands.
+
 ## Overview
 
 Integrate **Kimi K2.5** as an autonomous R&D subagent for Claude Code. **Claude is the Brain** (architect, coordinator, reviewer) and **Kimi is the Hands** (developer, implementer, debugger). Claude designs and delegates; Kimi implements and executes.
+
+Climi wires Kimi into Claude Code three ways:
+
+- A **role-aware wrapper script** that delegates to Kimi with one of seven specialized agent personas (or a generic template).
+- An **MCP bridge** that exposes Kimi as callable tools (`kimi_analyze`, `kimi_audit`, `kimi_trace`, `kimi_verify`) over JSON-RPC for any MCP-aware client.
+- **Git hooks** that auto-delegate coding tasks at `pre-commit`, `post-checkout`, and `pre-push`.
 
 ## What's New in v2.0
 
@@ -40,7 +48,7 @@ Integrate **Kimi K2.5** as an autonomous R&D subagent for Claude Code. **Claude 
 
 ```bash
 # Clone and install
-git clone https://github.com/usernamedasblueyeddevil/Climi.git
+git clone https://github.com/9thLevelSoftware/Climi.git
 cd Climi
 
 # Standard install (v1.0 features)
@@ -54,7 +62,7 @@ cd Climi
 
 ```bash
 # Set up MCP for Claude Code integration
-kimi-mcp setup --claude
+kimi-mcp-setup install
 ```
 
 ### 3. Use
@@ -167,6 +175,9 @@ Run `./install.sh` again. The installer:
 # With git diff context
 ./skills/kimi.agent.wrapper.sh -t verify --diff "Verify my changes are correct"
 
+# With automatic model selection (K2 vs K2.5)
+./skills/kimi.agent.wrapper.sh -r reviewer --auto-model "Review this codebase"
+
 # Set working directory
 ./skills/kimi.agent.wrapper.sh -r reviewer -w /path/to/project "Review this project"
 ```
@@ -178,24 +189,26 @@ USAGE:
     ./skills/kimi.agent.wrapper.sh [OPTIONS] "prompt"
 
 WRAPPER OPTIONS:
-    -r, --role ROLE      Agent role (maps to .kimi/agents/ROLE.yaml)
-    -m, --model MODEL    Kimi model (default: kimi-for-coding)
-    -w, --work-dir PATH  Working directory for Kimi
-    -t, --template TPL   Template to prepend (maps to .kimi/templates/TPL.md)
-    --diff               Include git diff (HEAD vs working tree) in prompt
-    --dry-run            Show command without executing
-    --verbose            Show wrapper debug output
-    -h, --help           Show help and exit
+    -r, --role ROLE        Agent role (maps to .kimi/agents/ROLE.yaml)
+    -m, --model MODEL      Kimi model (default: kimi-code/kimi-for-coding)
+    -w, --work-dir PATH    Working directory for Kimi
+    -t, --template TPL     Template to prepend (maps to .kimi/templates/TPL.md)
+    --auto-model           Enable automatic K2 vs K2.5 selection per task
+    --diff                 Include git diff (HEAD vs working tree) in prompt
+    --dry-run              Show command without executing
+    --verbose              Show wrapper debug output
+    -h, --help             Show help and exit
 
 KIMI CLI OPTIONS (pass-through):
-    --thinking           Enable thinking mode for deeper reasoning
-    --no-thinking        Disable thinking mode
-    -y, --yes, --yolo    Auto-approve all actions
-    --print              Run in non-interactive print mode
+    --thinking             Enable thinking mode for deeper reasoning
+    --no-thinking          Disable thinking mode
+    -y, --yes, --yolo      Auto-approve all actions
+    --print                Run in non-interactive print mode
     (and any other kimi CLI flags)
 
 ENVIRONMENT:
-    KIMI_PATH            Override kimi binary location
+    KIMI_PATH              Override kimi binary location
+    KIMI_FORCE_MODEL       Force model selection (k2 or k2.5)
 ```
 
 ## Agent Roles
@@ -262,7 +275,7 @@ Templates provide pre-built prompt structures for common tasks. Located in `.kim
 
 ## Claude Code Slash Commands
 
-When installed, these slash commands are available in Claude Code:
+Slash command definitions live in `dist/.claude/commands/kimi/` and are copied into your project (or `~/.claude/`) by `install.sh`. When installed, they are available in Claude Code as:
 
 | Command | Role | Description |
 |---------|------|-------------|
@@ -284,12 +297,58 @@ When installed, these slash commands are available in Claude Code:
 /kimi-hooks install
 ```
 
+## MCP Bridge (v2.0)
+
+The MCP bridge (`mcp-bridge/`) exposes Kimi as four JSON-RPC tools over stdio so any MCP-aware client (Claude Desktop, custom agents, IDE plugins) can call Kimi directly:
+
+- `kimi_analyze` — invoke the `reviewer` role
+- `kimi_audit` — invoke the `auditor` role
+- `kimi_trace` — invoke the `debugger` role
+- `kimi_verify` — invoke the `verify` template
+
+Setup:
+
+```bash
+# Install the MCP bridge (run during ./install.sh --with-hooks or standalone)
+./install.sh --with-hooks
+
+# Register the MCP server with Kimi CLI
+kimi-mcp-setup install
+
+# Inspect / start / stop the server
+kimi-mcp start
+kimi-mcp status
+kimi-mcp stop
+```
+
+Configuration lives at `~/.config/kimi-mcp/config.json` (default seeded from `mcp-bridge/config/default.json`). See [docs/MCP-SETUP.md](docs/MCP-SETUP.md) for full details.
+
+## Git Hooks (v2.0)
+
+Climi ships three git hooks (in `hooks/hooks/`) that automatically trigger Kimi delegations at well-known git events:
+
+| Hook | Trigger | Behavior |
+|------|---------|----------|
+| `pre-commit` | Before a commit is written | Auto-delegate staging-area review to the `reviewer` role |
+| `post-checkout` | After `git checkout` / branch switch | Re-run verification on the new HEAD |
+| `pre-push` | Before a push to remote | Auto-delegate `verify` template against outgoing commits |
+
+Install hooks into a repo with:
+
+```bash
+kimi-hooks install          # installs into .git/hooks of the current repo
+kimi-hooks list             # show installed hooks
+kimi-hooks uninstall        # remove them
+```
+
+See [docs/HOOKS-GUIDE.md](docs/HOOKS-GUIDE.md) for configuration options and how to scope hooks to specific paths.
+
 ## Documentation
 
 - [MCP Setup Guide](docs/MCP-SETUP.md) — Configure MCP server
 - [Hooks Guide](docs/HOOKS-GUIDE.md) — Git hooks configuration
 - [Model Selection](docs/MODEL-SELECTION.md) — K2 vs K2.5 guide
-- [Claude Integration](.claude/CLAUDE.md) — Complete command reference
+- [Claude Code Integration](skills/Claude-Code-Integration.md) — End-to-end integration walkthrough
 
 ## Migrating from v1.0
 
@@ -306,7 +365,7 @@ New components are additive — your existing workflow remains unchanged.
 
 ### CLAUDE.md Integration
 
-Add the Kimi section to your project's CLAUDE.md (template at `.claude/CLAUDE.md.kimi-section`):
+The Kimi workflow section is shipped inside the skill definition at `dist/.claude/skills/kimi-delegation/SKILL.md`. Add a `Kimi R&D Subagent` section to your project's `CLAUDE.md` so Claude Code honors the delegation rules. A typical section looks like:
 
 ```markdown
 ## Kimi R&D Subagent
@@ -351,25 +410,26 @@ Create `.kimi/context.md` or `KimiContext.md` in your project root. This content
 | Variable | Purpose |
 |----------|---------|
 | `KIMI_PATH` | Override kimi binary location (useful on Windows) |
+| `KIMI_FORCE_MODEL` | Force model selection when `--auto-model` is set (`k2` or `k2.5`) |
 
 ## Architecture
 
 ```
 +---------------------------------------------------------+
 |                    Claude Code                           |
-|  +-- /kimi-* slash commands                              |
-|  +-- SKILL.md (teaches delegation rules)                 |
-|  +-- CLAUDE.md.kimi-section (user config)                |
+|  +-- /kimi-* slash commands (dist/.claude/commands/)    |
+|  +-- SKILL.md (dist/.claude/skills/kimi-delegation/)     |
+|  +-- CLAUDE.md (user configures delegation rules)        |
 +----------------------------+----------------------------+
                              | invokes
                              v
 +---------------------------------------------------------+
-|               kimi.agent.wrapper.sh                      |
+|               skills/kimi.agent.wrapper.sh                |
 |  +-- CLI validation (kimi >= 1.7.0)                      |
 |  +-- Role resolution (.kimi/agents/*.yaml)               |
 |  +-- Template loading (.kimi/templates/*.md)             |
 |  +-- Context injection (context.md, --diff)              |
-|  +-- Prompt assembly                                     |
+|  +-- Prompt assembly + auto-model (K2 vs K2.5)           |
 +----------------------------+----------------------------+
                              | delegates to
                              v
@@ -379,12 +439,23 @@ Create `.kimi/context.md` or `KimiContext.md` in your project root. This content
 |  +-- Agent-based tool access                             |
 |  +-- Structured output                                   |
 +---------------------------------------------------------+
+
+        v2.0 add-ons (independent of the wrapper above)
+
++----------------------------+       +--------------------------+
+| mcp-bridge/bin/            |       | hooks/hooks/             |
+|   kimi-mcp-server          |       |   pre-commit             |
+|  (JSON-RPC over stdio:     |       |   post-checkout          |
+|   kimi_analyze, audit,     |       |   pre-push               |
+|   trace, verify)           |       | (auto-delegate at git    |
++----------------------------+       |  events)                 |
+                                     +--------------------------+
 ```
 
-### File Structure
+### Repository Layout
 
 ```
-multi-agent-workflow/
+Climi/
 +-- install.sh                      # Automated installer
 +-- uninstall.sh                    # Clean uninstaller
 +-- kimi.ps1                        # PowerShell shim (Windows)
@@ -396,12 +467,28 @@ multi-agent-workflow/
 |
 +-- skills/
 |   +-- kimi.agent.wrapper.sh       # Core wrapper script
-|   +-- kimi-mcp-server.sh          # MCP server (v2.0)
-|   +-- kimi-mcp.sh                 # MCP CLI wrapper (v2.0)
-|   +-- kimi-hooks.sh               # Hooks manager (v2.0)
-|   +-- kimi-hooks-setup.sh         # Hooks installer (v2.0)
 |   +-- kimi-model-selector.sh      # Model selector (v2.0)
-|   +-- Claude-Code-Integration.md  # Integration guide
+|   +-- kimi-cost-estimator.sh      # Cost estimator (v2.0)
+|   +-- Claude-Code-Integration.md  # Integration walkthrough
+|
++-- bin/                            # v2.0 CLI wrappers (installed to ~/.local/bin)
+|   +-- kimi-mcp                    # MCP CLI wrapper
+|   +-- kimi-mcp-setup              # MCP Kimi-CLI registration helper
+|   +-- kimi-hooks                  # Hooks manager
+|   +-- kimi-hooks-setup            # Hooks installer
+|
++-- mcp-bridge/                     # v2.0 MCP server
+|   +-- bin/kimi-mcp-server         # JSON-RPC server entry point
+|   +-- lib/                        # Server internals (mcp-core, tools, etc.)
+|   +-- config/                     # Default config + model rules
+|   +-- tests/                      # Bridge tests
+|
++-- hooks/                          # v2.0 git hooks (installed into .git/hooks)
+|   +-- hooks/pre-commit
+|   +-- hooks/post-checkout
+|   +-- hooks/pre-push
+|   +-- lib/                        # Shared hook helpers
+|   +-- config/                     # Hook configuration
 |
 +-- .kimi/
 |   +-- agents/                     # 7 agent roles
@@ -413,29 +500,24 @@ multi-agent-workflow/
 |   |   +-- implementer.yaml + .md
 |   |   +-- simplifier.yaml + .md
 |   +-- templates/                  # 6 query templates
-|   |   +-- feature.md
-|   |   +-- bug.md
-|   |   +-- verify.md
-|   |   +-- architecture.md
-|   |   +-- implement-ready.md
-|   |   +-- fix-ready.md
-|   +-- hooks/                      # Git hooks (v2.0)
-|   |   +-- pre-commit
-|   |   +-- post-checkout
-|   |   +-- pre-push
-|   |   +-- lib.sh                  # Shared hook library
+|       +-- feature.md
+|       +-- bug.md
+|       +-- verify.md
+|       +-- architecture.md
+|       +-- implement-ready.md
+|       +-- fix-ready.md
 |
-+-- .claude/
-    +-- commands/kimi/              # Slash commands
-    |   +-- kimi-analyze.md
-    |   +-- kimi-audit.md
-    |   +-- kimi-trace.md
-    |   +-- kimi-verify.md
-    |   +-- kimi-mcp.md             # v2.0
-    |   +-- kimi-hooks.md           # v2.0
-    +-- skills/kimi-delegation/
-    |   +-- SKILL.md                # Claude skill definition
-    +-- CLAUDE.md.kimi-section      # Config template
++-- dist/                           # Claude Code artifacts (copied by install.sh)
+    +-- .claude/
+        +-- commands/kimi/          # Slash commands
+        |   +-- kimi-analyze.md
+        |   +-- kimi-audit.md
+        |   +-- kimi-trace.md
+        |   +-- kimi-verify.md
+        |   +-- kimi-mcp.md         # v2.0
+        |   +-- kimi-hooks.md       # v2.0
+        +-- skills/kimi-delegation/
+            +-- SKILL.md            # Claude skill definition
 ```
 
 ## Response Format
@@ -551,7 +633,7 @@ pip install --upgrade kimi-cli
 
 ## License
 
-MIT License - see [LICENSE](LICENSE)
+MIT License.
 
 ## Contributing
 
