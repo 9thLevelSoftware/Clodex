@@ -1,11 +1,20 @@
-# Gemini Wrapper - Git Attributes
+# Clodex - Git Attributes
 # Ensures consistent line endings across platforms
+
+.gitattributes text eol=lf
+.gitignore text eol=lf
 
 # Force LF line endings for shell scripts (prevents CRLF issues on Windows)
 *.sh text eol=lf
 *.hook text eol=lf
 *.bash text eol=lf
 *.zsh text eol=lf
+*.bats text eol=lf
+*.py text eol=lf
+
+# Extensionless shell entrypoints and git hooks also need LF.
+bin/clodex text eol=lf
+mcp-bridge/bin/* text eol=lf
 
 # Keep markdown files normalized
 *.md text eol=lf

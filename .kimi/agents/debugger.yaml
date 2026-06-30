@@ -1,6 +1,0 @@
-version: 1
-agent:
-  extend: default
-  name: debugger
-  system_prompt_path: ./debugger.md
-  # No exclude_tools - full access for debugging operations

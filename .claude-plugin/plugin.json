@@ -1,0 +1,15 @@
+{
+  "name": "clodex",
+  "version": "0.1.0",
+  "description": "Claude Code and Codex CLI dual-agent workflow orchestration.",
+  "skills": {
+    "clodex-workflow": {
+      "path": "skills/clodex-workflow/SKILL.md"
+    }
+  },
+  "commands": {
+    "clodex-plan": "dist/.claude/commands/clodex/clodex-plan.md",
+    "clodex-build": "dist/.claude/commands/clodex/clodex-build.md",
+    "clodex-audit": "dist/.claude/commands/clodex/clodex-audit.md"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "clodex",
+  "version": "0.1.0",
+  "description": "Claude Code and Codex CLI dual-agent workflow orchestration.",
+  "skills": {
+    "clodex-workflow": {
+      "path": "skills/clodex-workflow/SKILL.md"
+    }
+  },
+  "mcp_servers": {
+    "clodex": {
+      "command": "python",
+      "args": ["-m", "clodex", "mcp-server"]
+    }
+  }
+}
