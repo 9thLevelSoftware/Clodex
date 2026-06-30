@@ -1,6 +1,0 @@
-version: 1
-agent:
-  extend: default
-  name: implementer
-  system_prompt_path: ./implementer.md
-  # No exclude_tools - full access for implementation operations

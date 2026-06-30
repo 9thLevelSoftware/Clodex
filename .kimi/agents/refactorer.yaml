@@ -1,6 +1,0 @@
-version: 1
-agent:
-  extend: default
-  name: refactorer
-  system_prompt_path: ./refactorer.md
-  # No exclude_tools - full access for refactoring operations
