@@ -190,7 +190,7 @@ raise SystemExit(2)
         else:
             for name in names:
                 path = self.bin / name
-                path.write_text(f"#!/usr/bin/env bash\nexec {sys.executable} \"$(dirname \"$0\")/fake_cli.py\" {name} \"$@\"\n", encoding="utf-8")
+                path.write_text(f"#!/usr/bin/env bash\nexec \"{sys.executable}\" \"$(dirname \"$0\")/fake_cli.py\" {name} \"$@\"\n", encoding="utf-8")
                 path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
