@@ -544,6 +544,30 @@ class ClodexTests(unittest.TestCase):
         self.assertFalse(any(path.endswith(".mcp.json") for path in paths))
         self.assertFalse(any(path.endswith(".codex/config.toml") for path in paths))
 
+    def test_native_plan_reports_invalid_utf8_target(self):
+        from clodex.native import plan_native_install
+
+        with TempRepo() as repo:
+            (repo / "CLAUDE.md").write_bytes(b"\xff\xfe\xff")
+            plan = plan_native_install(repo, no_mcp_config=True)
+        item = next(item for item in plan["files"] if Path(item["path"]).name == "CLAUDE.md")
+        self.assertEqual(item["status"], "invalid")
+        self.assertEqual(item["action"], "error")
+        self.assertIn("utf-8", item["error"].lower())
+
+    def test_apply_native_install_preserves_crlf_codex_config(self):
+        from clodex.native import apply_native_install
+
+        with TempRepo() as repo:
+            config = repo / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_bytes(b'model = "gpt-5.5"\r\n')
+            apply_native_install(repo)
+            content = config.read_bytes()
+        self.assertIn(b"# BEGIN CLODEX\r\n", content)
+        self.assertIn(b"[mcp_servers.clodex]\r\n", content)
+        self.assertIn(b'args = ["mcp-server"]\r\n', content)
+
     def test_render_mcp_json_preserves_existing_servers(self):
         from clodex.native import render_mcp_json
 
@@ -559,10 +583,28 @@ class ClodexTests(unittest.TestCase):
         with self.assertRaises(ManagedBlockError):
             render_mcp_json("{not-json")
 
+    def test_render_mcp_json_rejects_non_object_servers_without_force(self):
+        from clodex.native import render_mcp_json
+
+        with self.assertRaises(ManagedBlockError):
+            render_mcp_json('{"mcpServers":[]}')
+
+    def test_render_mcp_json_rejects_null_servers_without_force(self):
+        from clodex.native import render_mcp_json
+
+        with self.assertRaises(ManagedBlockError):
+            render_mcp_json('{"mcpServers":null}')
+
     def test_render_mcp_json_force_replaces_invalid_json(self):
         from clodex.native import render_mcp_json
 
         data = json.loads(render_mcp_json("{not-json", force=True))
+        self.assertEqual(data["mcpServers"]["clodex"]["command"], "clodex")
+
+    def test_render_mcp_json_force_replaces_non_object_servers(self):
+        from clodex.native import render_mcp_json
+
+        data = json.loads(render_mcp_json('{"mcpServers":[]}', force=True))
         self.assertEqual(data["mcpServers"]["clodex"]["command"], "clodex")
 
     def test_render_codex_toml_preserves_existing_config(self):

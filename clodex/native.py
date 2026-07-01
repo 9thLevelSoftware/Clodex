@@ -129,10 +129,16 @@ def render_mcp_json(existing: str, *, force: bool = False) -> str:
         if not force:
             raise ManagedBlockError(".mcp.json root must be an object")
         data = {}
-    servers = data.get("mcpServers")
-    if not isinstance(servers, dict):
+    if "mcpServers" not in data:
         servers = {}
         data["mcpServers"] = servers
+    else:
+        servers = data["mcpServers"]
+        if not isinstance(servers, dict):
+            if not force:
+                raise ManagedBlockError(".mcp.json mcpServers must be an object")
+            servers = {}
+            data["mcpServers"] = servers
     servers["clodex"] = clodex_mcp_server_entry()
     return json.dumps(data, indent=2, sort_keys=True) + "\n"
 
@@ -180,14 +186,14 @@ def target_status(path: Path, desired: str) -> str:
     if not path.exists():
         return "missing"
     try:
-        current = path.read_text(encoding="utf-8")
+        current = _read_text_preserve_newlines(path)
     except UnicodeDecodeError:
         return "invalid"
     return "current" if current == desired else "stale"
 
 
 def _planned_content(path: Path, kind: str, body: str, *, force: bool) -> str:
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    existing = _read_text_preserve_newlines(path) if path.exists() else ""
     if kind == "managed":
         return replace_managed_block(existing, body, force=force)[0]
     if kind == "json":
@@ -208,7 +214,19 @@ def plan_native_install(
     target_root = Path.home() if global_mode else repo_root
     files: list[dict[str, Any]] = []
     for path, kind, body in repo_native_targets(target_root, no_mcp_config=no_mcp_config):
-        content = _planned_content(path, kind, body, force=force)
+        try:
+            content = _planned_content(path, kind, body, force=force)
+        except UnicodeDecodeError as exc:
+            files.append(
+                {
+                    "path": str(path),
+                    "action": "error",
+                    "status": "invalid",
+                    "preview": "",
+                    "error": f"Invalid UTF-8: {exc}",
+                }
+            )
+            continue
         status = target_status(path, content)
         if status == "missing":
             action = "create"
@@ -248,11 +266,17 @@ def apply_native_install(
     )
     for item in plan["files"]:
         path = Path(item["path"])
-        if item["action"] == "unchanged":
+        if item["action"] in {"unchanged", "error"}:
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(item["preview"], encoding="utf-8", newline="\n")
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(item["preview"])
     return plan
+
+
+def _read_text_preserve_newlines(path: Path) -> str:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
 
 
 def _replace_managed_block(
