@@ -93,7 +93,7 @@ Default role contract:
 - Claude Code is the default strategist.
 - Codex is the default engineer.
 - Owner starts as `claude`.
-- handoff budget is {DEFAULT_HANDOFF_BUDGET}.
+- Handoff budget is {DEFAULT_HANDOFF_BUDGET}.
 - Phase order is `planning`, `implementation`, `audit`, `fix`, `decision`.
 
 Prefer MCP tools. If MCP is unavailable, use these CLI fallbacks:
@@ -116,13 +116,14 @@ def _replace_managed_block(
     *,
     force: bool,
 ) -> tuple[str, bool]:
-    block_body = normalize_block_body(body)
-    replacement = f"{begin_marker}\n{block_body}{end_marker}\n"
+    newline = _detect_newline(existing)
+    block_body = _normalize_block_body(body, newline)
+    replacement = f"{begin_marker}{newline}{block_body}{end_marker}{newline}"
     begin_count = existing.count(begin_marker)
     end_count = existing.count(end_marker)
 
     if begin_count == 0 and end_count == 0:
-        updated = existing + _append_separator(existing) + replacement
+        updated = existing + _append_separator(existing, newline) + replacement
         return updated, updated != existing
 
     begin = existing.find(begin_marker)
@@ -132,7 +133,7 @@ def _replace_managed_block(
             raise ManagedBlockError(f"Malformed Clodex managed block for {begin_marker!r}")
         marker_positions = [pos for pos in (begin, end) if pos != -1]
         prefix = existing[: min(marker_positions)] if marker_positions else existing
-        updated = prefix + _prefix_separator(prefix) + replacement
+        updated = prefix + _prefix_separator(prefix, newline) + replacement
         return updated, updated != existing
 
     end_after = _after_marker_line(existing, end + len(end_marker))
@@ -140,23 +141,47 @@ def _replace_managed_block(
     return updated, updated != existing
 
 
-def _append_separator(existing: str) -> str:
-    if not existing or existing.endswith("\n\n") or existing.endswith("\r\n\r\n"):
-        return ""
-    if existing.endswith("\n"):
-        return "\n"
-    return "\n\n"
+def _normalize_block_body(body: str, newline: str) -> str:
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.endswith("\n"):
+        normalized += "\n"
+    return normalized.replace("\n", newline)
 
 
-def _prefix_separator(prefix: str) -> str:
-    if not prefix or prefix.endswith("\n"):
-        return ""
+def _detect_newline(existing: str) -> str:
+    for index, char in enumerate(existing):
+        if char == "\r":
+            if existing[index : index + 2] == "\r\n":
+                return "\r\n"
+            return "\r"
+        if char == "\n":
+            return "\n"
     return "\n"
+
+
+def _append_separator(existing: str, newline: str) -> str:
+    if not existing or existing.endswith(newline * 2):
+        return ""
+    if _ends_with_newline(existing):
+        return newline
+    return newline * 2
+
+
+def _prefix_separator(prefix: str, newline: str) -> str:
+    if not prefix or _ends_with_newline(prefix):
+        return ""
+    return newline
+
+
+def _ends_with_newline(value: str) -> bool:
+    return value.endswith(("\r\n", "\n", "\r"))
 
 
 def _after_marker_line(existing: str, offset: int) -> int:
     if existing.startswith("\r\n", offset):
         return offset + 2
     if existing.startswith("\n", offset):
+        return offset + 1
+    if existing.startswith("\r", offset):
         return offset + 1
     return offset

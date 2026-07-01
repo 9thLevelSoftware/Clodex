@@ -20,9 +20,12 @@ from clodex.native import (
     BEGIN_MARKER,
     END_MARKER,
     ManagedBlockError,
+    TOML_BEGIN_MARKER,
+    TOML_END_MARKER,
     build_agents_block,
     build_claude_block,
     replace_managed_block,
+    replace_toml_managed_block,
 )
 from clodex.npm_bridge import main as npm_bridge_main
 from clodex.state import StateStore
@@ -474,6 +477,32 @@ class ClodexTests(unittest.TestCase):
         updated, changed = replace_managed_block("header\n<!-- BEGIN CLODEX -->\nmissing end\n", "new\n", force=True)
         self.assertTrue(changed)
         self.assertEqual(updated, "header\n<!-- BEGIN CLODEX -->\nnew\n<!-- END CLODEX -->\n")
+
+    def test_replace_managed_block_preserves_crlf_style(self):
+        existing = "header\r\n<!-- BEGIN CLODEX -->\r\nold\r\n<!-- END CLODEX -->\r\nfooter\r\n"
+        updated, changed = replace_managed_block(existing, "new\n")
+        self.assertTrue(changed)
+        self.assertEqual(updated, "header\r\n<!-- BEGIN CLODEX -->\r\nnew\r\n<!-- END CLODEX -->\r\nfooter\r\n")
+
+    def test_replace_toml_managed_block_appends_when_missing(self):
+        updated, changed = replace_toml_managed_block("header\n", "new\n")
+        self.assertTrue(changed)
+        self.assertEqual(updated, "header\n\n# BEGIN CLODEX\nnew\n# END CLODEX\n")
+
+    def test_replace_toml_managed_block_is_idempotent(self):
+        existing = f"{TOML_BEGIN_MARKER}\nnew\n{TOML_END_MARKER}\n"
+        updated, changed = replace_toml_managed_block(existing, "new\n")
+        self.assertFalse(changed)
+        self.assertEqual(updated, existing)
+
+    def test_replace_toml_managed_block_rejects_malformed_block_without_force(self):
+        with self.assertRaises(ManagedBlockError):
+            replace_toml_managed_block("header\n# BEGIN CLODEX\nmissing end\n", "new\n")
+
+    def test_replace_toml_managed_block_force_replaces_malformed_tail(self):
+        updated, changed = replace_toml_managed_block("header\n# BEGIN CLODEX\nmissing end\n", "new\n", force=True)
+        self.assertTrue(changed)
+        self.assertEqual(updated, "header\n# BEGIN CLODEX\nnew\n# END CLODEX\n")
 
     def test_native_instruction_templates_include_mcp_and_cli_fallbacks(self):
         claude = build_claude_block()
