@@ -11,6 +11,8 @@
 *.zsh text eol=lf
 *.bats text eol=lf
 *.py text eol=lf
+*.js text eol=lf
+*.json text eol=lf
 
 # Extensionless shell entrypoints and git hooks also need LF.
 bin/clodex text eol=lf

@@ -42,6 +42,19 @@ clodex build "Add a small feature"
 clodex apply <run-id>
 ```
 
+Install with npm:
+
+```bash
+npm install -g clodex
+clodex doctor
+```
+
+Run without installing:
+
+```bash
+npx clodex --json build --dry-run "Add a small feature"
+```
+
 From this checkout without installing:
 
 ```bash
