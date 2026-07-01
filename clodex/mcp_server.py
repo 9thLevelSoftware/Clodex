@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import uuid
 from typing import Any
 
 from .tasks import TaskManager
@@ -65,6 +66,54 @@ TOOLS = [
         "name": "clodex_task_cancel",
         "title": "Cancel async Clodex task",
         "description": "Request cancellation of a durable Clodex run.",
+        "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]},
+    },
+    {
+        "name": "clodex_handoff_create",
+        "title": "Create Clodex handoff",
+        "description": "Create a native Claude/Codex handoff run.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "task": {"type": "string"},
+                "owner": {"type": "string"},
+                "phase": {"type": "string"},
+                "handoff_budget": {"type": "integer"},
+            },
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "clodex_handoff_update",
+        "title": "Update Clodex handoff",
+        "description": "Record native handoff phase, actor, report, status, and budget usage.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "phase": {"type": "string"},
+                "actor": {"type": "string"},
+                "owner": {"type": "string"},
+                "increment_handoff": {"type": "boolean"},
+                "report": {"type": "object"},
+                "status": {"type": "string"},
+                "blocked_reason": {"type": "string"},
+                "diff_hash": {"type": "string"},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "clodex_handoff_get",
+        "title": "Get Clodex handoff",
+        "description": "Read native handoff state, events, artifacts, budget, and next actor.",
+        "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]},
+    },
+    {
+        "name": "clodex_handoff_decide",
+        "title": "Decide Clodex handoff",
+        "description": "Evaluate whether a native handoff is approved, needs fixes, or blocked.",
         "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]},
     },
 ]
@@ -164,6 +213,68 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     elif name == "clodex_task_cancel":
         result = TaskManager().cancel(str(arguments["run_id"]))
         return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": False}
+    elif name == "clodex_handoff_create":
+        handoff_budget = 6
+        if "handoff_budget" in arguments and arguments["handoff_budget"] is not None:
+            handoff_budget = int(arguments["handoff_budget"])
+        run = workflow.state.create_handoff(
+            str(arguments.get("run_id") or f"native-{uuid.uuid4().hex[:12]}"),
+            str(arguments["task"]),
+            owner=str(arguments.get("owner") or "claude"),
+            phase=str(arguments.get("phase") or "planning"),
+            handoff_budget=handoff_budget,
+        )
+        return {"content": [{"type": "text", "text": json.dumps(run, indent=2)}], "isError": False}
+    elif name == "clodex_handoff_update":
+        try:
+            run = workflow.state.update_handoff(
+                str(arguments["run_id"]),
+                phase=arguments.get("phase"),
+                actor=arguments.get("actor"),
+                owner=arguments.get("owner"),
+                increment_handoff=bool(arguments.get("increment_handoff", False)),
+                report=arguments.get("report") if isinstance(arguments.get("report"), dict) else None,
+                status=arguments.get("status"),
+                blocked_reason=arguments.get("blocked_reason"),
+                diff_hash=arguments.get("diff_hash"),
+            )
+        except ValueError as exc:
+            return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+        return {"content": [{"type": "text", "text": json.dumps(run, indent=2)}], "isError": run.get("status") == "blocked"}
+    elif name == "clodex_handoff_get":
+        data = workflow.state.get_handoff(str(arguments["run_id"]))
+        if data is None:
+            return {"content": [{"type": "text", "text": f"Unknown run: {arguments['run_id']}"}], "isError": True}
+        return {"content": [{"type": "text", "text": json.dumps(data, indent=2)}], "isError": False}
+    elif name == "clodex_handoff_decide":
+        data = workflow.state.get_handoff(str(arguments["run_id"]))
+        if data is None:
+            return {"content": [{"type": "text", "text": f"Unknown run: {arguments['run_id']}"}], "isError": True}
+
+        run = data["run"]
+        status = run.get("status")
+        if status == "approved":
+            decision = {"decision": "approved", "run_id": run["id"], "diff_hash": run.get("diff_hash")}
+            is_error = False
+        elif status in {"blocked", "failed", "cancelled", "completed", "applied"}:
+            decision = {
+                "decision": "blocked",
+                "run_id": run["id"],
+                "status": status,
+                "blocked_reason": run.get("blocked_reason") or run.get("error"),
+            }
+            is_error = True
+        else:
+            decision = {
+                "decision": "needs_fix",
+                "run_id": run["id"],
+                "phase": run.get("phase"),
+                "budget_remaining": data["budget_remaining"],
+                "next_expected_actor": data["next_expected_actor"],
+            }
+            is_error = False
+        workflow.state.add_event(run["id"], "handoff.decide", decision)
+        return {"content": [{"type": "text", "text": json.dumps(decision, indent=2)}], "isError": is_error}
     else:
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
     return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": result.status == "blocked"}
