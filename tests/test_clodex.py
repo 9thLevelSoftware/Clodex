@@ -184,7 +184,7 @@ raise SystemExit(2)
         if os.name == "nt":
             for name in names:
                 (self.bin / f"{name}.cmd").write_text(
-                    f"@echo off\r\n{sys.executable} \"%~dp0fake_cli.py\" {name} %*\r\n",
+                    f"@echo off\r\n\"{sys.executable}\" \"%~dp0fake_cli.py\" {name} %*\r\n",
                     encoding="utf-8",
                 )
         else:
