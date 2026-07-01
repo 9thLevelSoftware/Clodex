@@ -12,6 +12,10 @@ def now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _int_or_default(value: Any, default: int) -> int:
+    return default if value is None else int(value)
+
+
 class StateStore:
     def __init__(self, path: Path):
         self.path = path
@@ -265,8 +269,8 @@ class StateStore:
                 raise ValueError(f"unknown run: {run_id}")
 
             current = dict(row)
-            handoff_count = int(current.get("handoff_count") or 0)
-            handoff_budget = int(current.get("handoff_budget") or 6)
+            handoff_count = _int_or_default(current.get("handoff_count"), 0)
+            handoff_budget = _int_or_default(current.get("handoff_budget"), 6)
             next_count = handoff_count + (1 if increment_handoff else 0)
             next_status = status or str(current["status"])
             next_blocked_reason = blocked_reason if blocked_reason is not None else current.get("blocked_reason")
@@ -309,6 +313,8 @@ class StateStore:
 
             updated = con.execute("select * from runs where id=?", (run_id,)).fetchone()
             updated_run = dict(updated)
+            updated_count = _int_or_default(updated_run.get("handoff_count"), 0)
+            updated_budget = _int_or_default(updated_run.get("handoff_budget"), 6)
             event_data: dict[str, Any] = {
                 "actor": actor,
                 "owner": updated_run.get("owner"),
@@ -316,7 +322,7 @@ class StateStore:
                 "status": updated_run.get("status"),
                 "handoff_count": updated_run.get("handoff_count"),
                 "handoff_budget": updated_run.get("handoff_budget"),
-                "budget_remaining": max(int(updated_run.get("handoff_budget") or 0) - int(updated_run.get("handoff_count") or 0), 0),
+                "budget_remaining": max(updated_budget - updated_count, 0),
             }
             if report is not None:
                 event_data["report"] = report
@@ -348,8 +354,8 @@ class StateStore:
                 events.append(event)
 
             artifacts = [dict(artifact) for artifact in con.execute("select * from artifacts where run_id=? order by id", (run_id,))]
-            handoff_count = int(run.get("handoff_count") or 0)
-            handoff_budget = int(run.get("handoff_budget") or 0)
+            handoff_count = _int_or_default(run.get("handoff_count"), 0)
+            handoff_budget = _int_or_default(run.get("handoff_budget"), 6)
             next_expected_actor = "codex" if run.get("last_actor") == "claude" else "claude"
             return {
                 "run": run,

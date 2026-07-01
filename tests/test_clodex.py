@@ -255,6 +255,15 @@ class ClodexTests(unittest.TestCase):
             self.assertEqual(second["status"], "blocked")
             self.assertEqual(second["blocked_reason"], "handoff budget exhausted")
 
+    def test_handoff_update_blocks_immediately_with_zero_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=0)
+            result = store.update_handoff("run-native", phase="implementation", actor="claude", increment_handoff=True)
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["handoff_count"], 1)
+            self.assertEqual(result["blocked_reason"], "handoff budget exhausted")
+
     def test_handoff_get_includes_latest_events_and_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(Path(tmp) / "state.sqlite3")
