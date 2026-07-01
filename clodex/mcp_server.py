@@ -336,7 +336,8 @@ def handoff_budget_argument(arguments: dict[str, Any]) -> int:
 
 
 def handoff_agreement(data: dict[str, Any]) -> dict[str, Any] | None:
-    approvals: dict[str, set[str]] = {}
+    latest_hash: str | None = None
+    approvals: set[str] = set()
     for event in data.get("events") or []:
         if event.get("event") != "handoff.update":
             continue
@@ -344,17 +345,24 @@ def handoff_agreement(data: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(event_data, dict):
             continue
         report = event_data.get("report")
-        if not isinstance(report, dict) or report.get("approved") is not True:
-            continue
+        if not isinstance(report, dict):
+            report = {}
         actor = normalized_actor(event_data.get("actor") or report.get("actor"))
         diff_hash = normalized_diff_hash(event_data.get("diff_hash") or report.get("diff_hash"))
-        if actor is None or diff_hash is None:
+        if diff_hash is None:
             continue
-        approvals.setdefault(diff_hash, set()).add(actor)
+        if diff_hash != latest_hash:
+            latest_hash = diff_hash
+            approvals = set()
+        if actor is None:
+            continue
+        if report.get("approved") is True:
+            approvals.add(actor)
+        elif report.get("approved") is False:
+            approvals.discard(actor)
 
-    for diff_hash, actors in approvals.items():
-        if {"claude", "codex"}.issubset(actors):
-            return {"diff_hash": diff_hash, "approved_by": sorted(actors)}
+    if latest_hash is not None and {"claude", "codex"}.issubset(approvals):
+        return {"diff_hash": latest_hash, "approved_by": sorted(approvals)}
     return None
 
 

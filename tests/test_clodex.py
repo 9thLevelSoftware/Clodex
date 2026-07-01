@@ -1083,6 +1083,135 @@ class ClodexTests(unittest.TestCase):
         self.assertTrue(any(event["event"] == "handoff.approved" for event in data["events"]))
         self.assertTrue(any(event["event"] == "handoff.decide" for event in data["events"]))
 
+    def test_mcp_handoff_decide_requires_approvals_for_latest_diff_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = "\n".join(
+                json.dumps(item)
+                for item in [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_create",
+                            "arguments": {"run_id": "run-stale-approval", "task": "native task", "handoff_budget": 6},
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-stale-approval",
+                                "actor": "claude",
+                                "diff_hash": "abc123",
+                                "report": {"approved": True},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-stale-approval",
+                                "actor": "codex",
+                                "diff_hash": "abc123",
+                                "report": {"approved": True},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-stale-approval",
+                                "actor": "codex",
+                                "diff_hash": "def456",
+                                "report": {"approved": False, "summary": "new diff needs review"},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 5,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_decide", "arguments": {"run_id": "run-stale-approval"}},
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 6,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-stale-approval",
+                                "actor": "claude",
+                                "diff_hash": "def456",
+                                "report": {"approved": True},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 7,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-stale-approval",
+                                "actor": "codex",
+                                "diff_hash": "def456",
+                                "report": {"approved": True},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 8,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_decide", "arguments": {"run_id": "run-stale-approval"}},
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 9,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_get", "arguments": {"run_id": "run-stale-approval"}},
+                    },
+                ]
+            ) + "\n"
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "mcp-server"],
+                input=payload,
+                cwd=tmp,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        responses = [json.loads(line) for line in result.stdout.splitlines()]
+        first_decision = json.loads(responses[4]["result"]["content"][0]["text"])
+        self.assertFalse(responses[4]["result"]["isError"])
+        self.assertEqual(first_decision["decision"], "needs_fix")
+
+        final_decision = json.loads(responses[7]["result"]["content"][0]["text"])
+        self.assertFalse(responses[7]["result"]["isError"])
+        self.assertEqual(final_decision["decision"], "approved")
+        self.assertEqual(final_decision["diff_hash"], "def456")
+
+        data = json.loads(responses[8]["result"]["content"][0]["text"])
+        self.assertEqual(data["run"]["status"], "approved")
+        self.assertEqual(data["run"]["diff_hash"], "def456")
+
     def test_mcp_handoff_budget_exhaustion_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
             payload = "\n".join(
