@@ -1089,6 +1089,156 @@ class ClodexTests(unittest.TestCase):
         self.assertEqual(data["run"]["handoff_count"], 0)
         self.assertIsNone(data["run"]["last_actor"])
 
+    def test_mcp_handoff_create_invalid_budget_returns_tool_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            request = {
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": {
+                    "name": "clodex_handoff_create",
+                    "arguments": {"run_id": "run-invalid-budget", "task": "native task", "handoff_budget": "not-an-int"},
+                },
+            }
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "mcp-server"],
+                input=json.dumps(request) + "\n",
+                cwd=tmp,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout.splitlines()[0])
+        self.assertEqual(response["id"], 41)
+        self.assertNotIn("error", response)
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("not-an-int", response["result"]["content"][0]["text"])
+
+    def test_mcp_handoff_create_negative_budget_returns_tool_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            request = {
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {
+                    "name": "clodex_handoff_create",
+                    "arguments": {"run_id": "run-negative-budget", "task": "native task", "handoff_budget": -1},
+                },
+            }
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "mcp-server"],
+                input=json.dumps(request) + "\n",
+                cwd=tmp,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout.splitlines()[0])
+        self.assertEqual(response["id"], 42)
+        self.assertNotIn("error", response)
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("handoff_budget must be non-negative", response["result"]["content"][0]["text"])
+
+    def test_mcp_handoff_create_duplicate_run_id_returns_tool_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            create = {
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "tools/call",
+                "params": {
+                    "name": "clodex_handoff_create",
+                    "arguments": {"run_id": "run-duplicate", "task": "native task"},
+                },
+            }
+            duplicate = {
+                "jsonrpc": "2.0",
+                "id": 44,
+                "method": "tools/call",
+                "params": {
+                    "name": "clodex_handoff_create",
+                    "arguments": {"run_id": "run-duplicate", "task": "native task"},
+                },
+            }
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "mcp-server"],
+                input=json.dumps(create) + "\n" + json.dumps(duplicate) + "\n",
+                cwd=tmp,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        responses = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(responses[0]["id"], 43)
+        self.assertFalse(responses[0]["result"]["isError"])
+        self.assertEqual(responses[1]["id"], 44)
+        self.assertNotIn("error", responses[1])
+        self.assertTrue(responses[1]["result"]["isError"])
+        self.assertIn("UNIQUE constraint failed", responses[1]["result"]["content"][0]["text"])
+
+    def test_mcp_handoff_missing_required_arguments_return_tool_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = "\n".join(
+                json.dumps(item)
+                for item in [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 45,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_create", "arguments": {"run_id": "run-missing-task"}},
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 46,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_update", "arguments": {"actor": "claude"}},
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 47,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_get", "arguments": {}},
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 48,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_decide", "arguments": {}},
+                    },
+                ]
+            ) + "\n"
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "mcp-server"],
+                input=payload,
+                cwd=tmp,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        responses = [json.loads(line) for line in result.stdout.splitlines()]
+        expected = {
+            45: "Missing required argument: task",
+            46: "Missing required argument: run_id",
+            47: "Missing required argument: run_id",
+            48: "Missing required argument: run_id",
+        }
+        self.assertEqual({response["id"] for response in responses}, set(expected))
+        for response in responses:
+            self.assertNotIn("error", response)
+            self.assertTrue(response["result"]["isError"])
+            self.assertEqual(response["result"]["content"][0]["text"], expected[response["id"]])
+
     def test_task_start_get_cancel_lifecycle(self):
         with TempRepo() as repo, FakeCliPath(sleep_seconds=1):
             start = subprocess.run(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import uuid
 from typing import Any
@@ -118,6 +119,13 @@ TOOLS = [
     },
 ]
 
+HANDOFF_TOOL_NAMES = {
+    "clodex_handoff_create",
+    "clodex_handoff_update",
+    "clodex_handoff_get",
+    "clodex_handoff_decide",
+}
+
 
 def main() -> int:
     for line in sys.stdin:
@@ -181,6 +189,9 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if name in HANDOFF_TOOL_NAMES and not isinstance(arguments, dict):
+        return call_text("Arguments must be an object", is_error=True)
+
     workflow = ClodexWorkflow()
     if name == "clodex_plan":
         result = workflow.plan(str(arguments["task"]), dry_run=bool(arguments.get("dry_run", False)))
@@ -214,21 +225,22 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = TaskManager().cancel(str(arguments["run_id"]))
         return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": False}
     elif name == "clodex_handoff_create":
-        handoff_budget = 6
-        if "handoff_budget" in arguments and arguments["handoff_budget"] is not None:
-            handoff_budget = int(arguments["handoff_budget"])
-        run = workflow.state.create_handoff(
-            str(arguments.get("run_id") or f"native-{uuid.uuid4().hex[:12]}"),
-            str(arguments["task"]),
-            owner=str(arguments.get("owner") or "claude"),
-            phase=str(arguments.get("phase") or "planning"),
-            handoff_budget=handoff_budget,
-        )
-        return {"content": [{"type": "text", "text": json.dumps(run, indent=2)}], "isError": False}
+        try:
+            handoff_budget = handoff_budget_argument(arguments)
+            run = workflow.state.create_handoff(
+                str(arguments.get("run_id") or f"native-{uuid.uuid4().hex[:12]}"),
+                str(required_argument(arguments, "task")),
+                owner=str(arguments.get("owner") or "claude"),
+                phase=str(arguments.get("phase") or "planning"),
+                handoff_budget=handoff_budget,
+            )
+        except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+            return call_text(expected_handoff_error(exc), is_error=True)
+        return call_json(run)
     elif name == "clodex_handoff_update":
         try:
             run = workflow.state.update_handoff(
-                str(arguments["run_id"]),
+                str(required_argument(arguments, "run_id")),
                 phase=arguments.get("phase"),
                 actor=arguments.get("actor"),
                 owner=arguments.get("owner"),
@@ -238,18 +250,26 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 blocked_reason=arguments.get("blocked_reason"),
                 diff_hash=arguments.get("diff_hash"),
             )
-        except ValueError as exc:
-            return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
-        return {"content": [{"type": "text", "text": json.dumps(run, indent=2)}], "isError": run.get("status") == "blocked"}
+        except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+            return call_text(expected_handoff_error(exc), is_error=True)
+        return call_json(run, is_error=run.get("status") == "blocked")
     elif name == "clodex_handoff_get":
-        data = workflow.state.get_handoff(str(arguments["run_id"]))
+        try:
+            run_id = str(required_argument(arguments, "run_id"))
+            data = workflow.state.get_handoff(run_id)
+        except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+            return call_text(expected_handoff_error(exc), is_error=True)
         if data is None:
-            return {"content": [{"type": "text", "text": f"Unknown run: {arguments['run_id']}"}], "isError": True}
-        return {"content": [{"type": "text", "text": json.dumps(data, indent=2)}], "isError": False}
+            return call_text(f"Unknown run: {run_id}", is_error=True)
+        return call_json(data)
     elif name == "clodex_handoff_decide":
-        data = workflow.state.get_handoff(str(arguments["run_id"]))
+        try:
+            run_id = str(required_argument(arguments, "run_id"))
+            data = workflow.state.get_handoff(run_id)
+        except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+            return call_text(expected_handoff_error(exc), is_error=True)
         if data is None:
-            return {"content": [{"type": "text", "text": f"Unknown run: {arguments['run_id']}"}], "isError": True}
+            return call_text(f"Unknown run: {run_id}", is_error=True)
 
         run = data["run"]
         status = run.get("status")
@@ -274,10 +294,37 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             }
             is_error = False
         workflow.state.add_event(run["id"], "handoff.decide", decision)
-        return {"content": [{"type": "text", "text": json.dumps(decision, indent=2)}], "isError": is_error}
+        return call_json(decision, is_error=is_error)
     else:
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
     return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": result.status == "blocked"}
+
+
+def call_text(text: str, is_error: bool = False) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": text}], "isError": is_error}
+
+
+def call_json(data: Any, is_error: bool = False) -> dict[str, Any]:
+    return call_text(json.dumps(data, indent=2), is_error=is_error)
+
+
+def required_argument(arguments: dict[str, Any], key: str) -> Any:
+    if key not in arguments or arguments[key] is None:
+        raise KeyError(key)
+    return arguments[key]
+
+
+def handoff_budget_argument(arguments: dict[str, Any]) -> int:
+    if "handoff_budget" not in arguments or arguments["handoff_budget"] is None:
+        return 6
+    return int(arguments["handoff_budget"])
+
+
+def expected_handoff_error(exc: Exception) -> str:
+    if isinstance(exc, KeyError):
+        key = exc.args[0] if exc.args else "argument"
+        return f"Missing required argument: {key}"
+    return str(exc)
 
 
 def task_result(data: dict[str, Any]) -> dict[str, Any]:
