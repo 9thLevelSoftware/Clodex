@@ -56,10 +56,17 @@ class TempRepo:
 
 
 class FakeCliPath:
-    def __init__(self, reject_once: bool = False, malformed_once: bool = False, sleep_seconds: float = 0):
+    def __init__(
+        self,
+        reject_once: bool = False,
+        malformed_once: bool = False,
+        sleep_seconds: float = 0,
+        include_clodex: bool = False,
+    ):
         self.reject_once = reject_once
         self.malformed_once = malformed_once
         self.sleep_seconds = sleep_seconds
+        self.include_clodex = include_clodex
 
     def __enter__(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -161,14 +168,17 @@ raise SystemExit(2)
 """,
             encoding="utf-8",
         )
+        names = ["claude", "codex"]
+        if self.include_clodex:
+            names.append("clodex")
         if os.name == "nt":
-            for name in ("claude", "codex"):
+            for name in names:
                 (self.bin / f"{name}.cmd").write_text(
                     f"@echo off\r\n{sys.executable} \"%~dp0fake_cli.py\" {name} %*\r\n",
                     encoding="utf-8",
                 )
         else:
-            for name in ("claude", "codex"):
+            for name in names:
                 path = self.bin / name
                 path.write_text(f"#!/usr/bin/env bash\nexec {sys.executable} \"$(dirname \"$0\")/fake_cli.py\" {name} \"$@\"\n", encoding="utf-8")
                 path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -450,7 +460,7 @@ class ClodexTests(unittest.TestCase):
             self.assertIn(".codex", item["error"])
 
     def test_cli_native_doctor_combines_doctor_and_native_status(self):
-        with TempRepo() as repo, FakeCliPath():
+        with TempRepo() as repo, FakeCliPath(include_clodex=True):
             subprocess.run(
                 [sys.executable, "-m", "clodex", "--json", "init"],
                 cwd=repo,
@@ -474,7 +484,38 @@ class ClodexTests(unittest.TestCase):
             self.assertTrue(data["ok"])
             self.assertTrue(data["doctor"]["claude"]["ok"])
             self.assertTrue(data["doctor"]["codex"]["ok"])
-            self.assertIn("npm_launcher", data)
+            self.assertTrue(data["npm_launcher"]["ok"])
+
+    def test_native_doctor_fails_when_npm_launcher_missing(self):
+        from clodex.native import native_doctor
+
+        with TempRepo() as repo, FakeCliPath():
+            subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "init"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+
+            original_which = shutil.which
+
+            def without_clodex(command, *args, **kwargs):
+                if command in {"clodex", "clodex.cmd", "clodex.ps1"}:
+                    return None
+                return original_which(command, *args, **kwargs)
+
+            with mock.patch("clodex.native.shutil.which", side_effect=without_clodex):
+                exit_code, data = native_doctor(repo)
+
+            self.assertNotEqual(exit_code, 0)
+            self.assertFalse(data["npm_launcher"]["ok"])
+            self.assertFalse(data["ok"])
+            self.assertTrue(data["native"]["ok"])
+            self.assertTrue(data["doctor"]["claude"]["ok"])
+            self.assertTrue(data["doctor"]["codex"]["ok"])
 
     def test_build_happy_path_creates_agreement(self):
         with TempRepo() as repo, FakeCliPath():

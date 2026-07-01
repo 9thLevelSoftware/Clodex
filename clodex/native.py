@@ -392,11 +392,12 @@ def native_doctor(
     )
     doctor_code, doctor = run_doctor(repo_root)
     npm_launcher = shutil.which("clodex") or shutil.which("clodex.cmd") or shutil.which("clodex.ps1")
+    npm_launcher_status = {"ok": npm_launcher is not None, "path": npm_launcher}
     data = {
-        "ok": native["ok"] and doctor_code == 0,
+        "ok": native["ok"] and doctor_code == 0 and npm_launcher_status["ok"],
         "native": native,
         "doctor": doctor,
-        "npm_launcher": {"ok": npm_launcher is not None, "path": npm_launcher},
+        "npm_launcher": npm_launcher_status,
         "python": {
             "ok": sys.version_info >= (3, 12),
             "executable": sys.executable,
