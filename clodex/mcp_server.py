@@ -350,6 +350,8 @@ def handoff_agreement(data: dict[str, Any]) -> dict[str, Any] | None:
         actor = normalized_actor(event_data.get("actor") or report.get("actor"))
         diff_hash = normalized_diff_hash(event_data.get("diff_hash") or report.get("diff_hash"))
         if diff_hash is None:
+            if latest_hash is not None and actor is not None and report.get("approved") is False:
+                approvals.discard(actor)
             continue
         if diff_hash != latest_hash:
             latest_hash = diff_hash

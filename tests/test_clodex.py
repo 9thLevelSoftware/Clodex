@@ -1212,6 +1212,110 @@ class ClodexTests(unittest.TestCase):
         self.assertEqual(data["run"]["status"], "approved")
         self.assertEqual(data["run"]["diff_hash"], "def456")
 
+    def test_mcp_handoff_decide_treats_hashless_rejection_as_withdrawal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = "\n".join(
+                json.dumps(item)
+                for item in [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_create",
+                            "arguments": {"run_id": "run-withdraw", "task": "native task", "handoff_budget": 6},
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-withdraw",
+                                "actor": "claude",
+                                "diff_hash": "abc123",
+                                "report": {"approved": True},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-withdraw",
+                                "actor": "codex",
+                                "diff_hash": "abc123",
+                                "report": {"approved": True},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-withdraw",
+                                "actor": "codex",
+                                "report": {"approved": False, "summary": "withdrawing approval"},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 5,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_decide", "arguments": {"run_id": "run-withdraw"}},
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 6,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-withdraw",
+                                "actor": "codex",
+                                "diff_hash": "abc123",
+                                "report": {"approved": True},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 7,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_decide", "arguments": {"run_id": "run-withdraw"}},
+                    },
+                ]
+            ) + "\n"
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "mcp-server"],
+                input=payload,
+                cwd=tmp,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        responses = [json.loads(line) for line in result.stdout.splitlines()]
+        withdrawn = json.loads(responses[4]["result"]["content"][0]["text"])
+        self.assertFalse(responses[4]["result"]["isError"])
+        self.assertEqual(withdrawn["decision"], "needs_fix")
+
+        approved = json.loads(responses[6]["result"]["content"][0]["text"])
+        self.assertFalse(responses[6]["result"]["isError"])
+        self.assertEqual(approved["decision"], "approved")
+        self.assertEqual(approved["diff_hash"], "abc123")
+
     def test_mcp_handoff_budget_exhaustion_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
             payload = "\n".join(
