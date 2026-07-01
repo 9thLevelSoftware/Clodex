@@ -7,13 +7,17 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from clodex.commands import claude_plan_command, codex_exec_command, codex_review_command
 from clodex.config import load_config
 from clodex.jsonutil import extract_json_object
+from clodex.state import StateStore
+from clodex.trace import TraceWriter
 from clodex.workflow import ClodexWorkflow
+from clodex.workspace import DirtyWorkspaceError, WorkspaceManager
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,9 +41,10 @@ class TempRepo:
 
 
 class FakeCliPath:
-    def __init__(self, reject_once: bool = False, malformed_once: bool = False):
+    def __init__(self, reject_once: bool = False, malformed_once: bool = False, sleep_seconds: float = 0):
         self.reject_once = reject_once
         self.malformed_once = malformed_once
+        self.sleep_seconds = sleep_seconds
 
     def __enter__(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -74,6 +79,10 @@ name = sys.argv[1]
 args = sys.argv[2:]
 stdin = sys.stdin.read()
 
+if {self.sleep_seconds!r}:
+    import time
+    time.sleep({self.sleep_seconds!r})
+
 if '--version' in args:
     print(name + ' fake 1.0.0')
     raise SystemExit(0)
@@ -94,12 +103,20 @@ if name == 'claude':
         raise SystemExit(0)
     if 'adversarial auditor' in stdin:
         h = requested_hash()
+        reviewer = 'claude-plan'
+        persona = 'plan-adherence'
+        reviewer_match = re.search(r'Reviewer ID: ([^\\n]+)', stdin)
+        persona_match = re.search(r'Persona: ([^\\n]+)', stdin)
+        if reviewer_match:
+            reviewer = reviewer_match.group(1).strip()
+        if persona_match:
+            persona = persona_match.group(1).strip()
         reject_marker = Path('.fake-claude-reject')
         if {str(self.reject_once)!r} == 'True' and not reject_marker.exists():
             reject_marker.write_text('seen')
-            print(json.dumps({{'approved': False, 'diff_hash': h, 'summary': 'reject once', 'findings': [], 'required_fixes': ['append fixed line']}}))
+            print(json.dumps({{'approved': False, 'diff_hash': h, 'reviewer_id': reviewer, 'persona': persona, 'summary': 'reject once', 'findings': [], 'required_fixes': ['append fixed line']}}))
         else:
-            print(json.dumps({{'approved': True, 'diff_hash': h, 'summary': 'ok', 'findings': [], 'required_fixes': []}}))
+            print(json.dumps({{'approved': True, 'diff_hash': h, 'reviewer_id': reviewer, 'persona': persona, 'summary': 'ok', 'findings': [], 'required_fixes': []}}))
     else:
         print(json.dumps({{'goal': 'test goal', 'scope': ['repo'], 'out_of_scope': [], 'implementation_spec': ['write implemented.txt'], 'acceptance_criteria': ['diff exists'], 'risks': [], 'test_commands': ['python -m unittest']}}))
     raise SystemExit(0)
@@ -107,7 +124,15 @@ if name == 'claude':
 if name == 'codex':
     if args and args[0] == 'review':
         h = requested_hash()
-        print(json.dumps({{'approved': True, 'diff_hash': h, 'summary': 'ok', 'findings': [], 'required_fixes': []}}))
+        reviewer = 'codex-architecture'
+        persona = 'architecture'
+        reviewer_match = re.search(r'Reviewer ID: ([^\\n]+)', stdin)
+        persona_match = re.search(r'Persona: ([^\\n]+)', stdin)
+        if reviewer_match:
+            reviewer = reviewer_match.group(1).strip()
+        if persona_match:
+            persona = persona_match.group(1).strip()
+        print(json.dumps({{'approved': True, 'diff_hash': h, 'reviewer_id': reviewer, 'persona': persona, 'summary': 'ok', 'findings': [], 'required_fixes': []}}))
         raise SystemExit(0)
     if 'Required fixes' in stdin:
         Path('implemented.txt').write_text('implemented\\nfixed\\n', encoding='utf-8')
@@ -142,9 +167,66 @@ class ClodexTests(unittest.TestCase):
             self.assertEqual(config.claude["effort"], "max")
             self.assertEqual(config.codex["model"], "gpt-5.5")
             self.assertEqual(config.codex["reasoning_effort"], "xhigh")
+            self.assertEqual(config.workspace["backend"], "git-worktree")
+            self.assertEqual(config.workspace["apply_mode"], "manual")
+            self.assertEqual(config.codex["approval_profile"], "ci")
+            self.assertTrue(config.mcp["async_tasks"])
+            self.assertTrue(config.tracing["enabled"])
+            self.assertGreaterEqual(len(config.reviewers), 2)
             self.assertIn("--permission-mode", claude_plan_command(config).argv)
             self.assertIn("model_reasoning_effort=\"xhigh\"", codex_exec_command(config, repo).argv)
             self.assertIn("--uncommitted", codex_review_command(config).argv)
+
+    def test_approval_profiles_change_codex_command(self):
+        with TempRepo() as repo:
+            config = load_config(repo)
+            ci = codex_exec_command(config, repo).argv
+            local = codex_exec_command(config, repo, approval_profile="local").argv
+            auto = codex_exec_command(config, repo, approval_profile="auto_review").argv
+            self.assertIn("never", ci)
+            self.assertIn("on-request", local)
+            self.assertIn("approvals_reviewer=\"auto_review\"", auto)
+
+    def test_state_migrations_add_v2_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state.sqlite3"
+            store = StateStore(db)
+            tables = store.table_names()
+            self.assertIn("schema_version", tables)
+            self.assertIn("run_events", tables)
+            self.assertIn("artifacts", tables)
+            self.assertIn("workspace_locks", tables)
+            self.assertIn("cancellations", tables)
+            self.assertEqual(store.schema_version(), 2)
+
+    def test_trace_writer_appends_jsonl_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = TraceWriter(Path(tmp), "run-1")
+            trace.event("phase.start", {"phase": "planning"})
+            lines = (Path(tmp) / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1)
+            event = json.loads(lines[0])
+            self.assertEqual(event["run_id"], "run-1")
+            self.assertEqual(event["event"], "phase.start")
+            self.assertEqual(event["data"]["phase"], "planning")
+
+    def test_workspace_manager_refuses_dirty_source(self):
+        with TempRepo() as repo:
+            (repo / "seed.txt").write_text("dirty\n", encoding="utf-8")
+            manager = WorkspaceManager(repo, load_config(repo))
+            with self.assertRaises(DirtyWorkspaceError):
+                manager.prepare("run-dirty", backend="git-worktree")
+
+    def test_worktree_build_isolated_until_apply(self):
+        with TempRepo() as repo, FakeCliPath():
+            result = ClodexWorkflow(repo).build("implement fixture")
+            self.assertEqual(result.status, "approved")
+            self.assertFalse((repo / "implemented.txt").exists())
+            apply_result = ClodexWorkflow(repo).apply_run(result.run_id)
+            self.assertEqual(apply_result.status, "applied")
+            self.assertTrue((repo / "implemented.txt").exists())
+            workspace = Path(result.data["workspace"]["path"])
+            self.assertTrue(workspace.exists())
 
     def test_json_extraction_handles_fenced_json(self):
         value = extract_json_object("```json\n{\"approved\": true}\n```")
@@ -168,17 +250,31 @@ class ClodexTests(unittest.TestCase):
 
     def test_build_happy_path_creates_agreement(self):
         with TempRepo() as repo, FakeCliPath():
-            result = ClodexWorkflow(repo).build("implement fixture")
+            result = ClodexWorkflow(repo).build("implement fixture", workspace_backend="local")
             self.assertEqual(result.status, "approved")
             agreement = json.loads((Path(result.artifacts_dir) / "05-agreement.json").read_text(encoding="utf-8"))
             self.assertTrue(agreement["approved"])
             self.assertTrue((repo / "implemented.txt").exists())
+            self.assertTrue((Path(result.artifacts_dir) / "trace.jsonl").exists())
+            self.assertTrue((Path(result.artifacts_dir) / "reviewers" / "claude-plan.json").exists())
 
     def test_rejection_triggers_fix_loop(self):
         with TempRepo() as repo, FakeCliPath(reject_once=True):
-            result = ClodexWorkflow(repo).build("implement fixture")
+            result = ClodexWorkflow(repo).build("implement fixture", workspace_backend="local")
             self.assertEqual(result.status, "approved")
             self.assertIn("fixed", (repo / "implemented.txt").read_text(encoding="utf-8"))
+
+    def test_required_reviewer_rejection_blocks(self):
+        with TempRepo() as repo:
+            config = repo / "CLODEX.md"
+            config.write_text(
+                config.read_text(encoding="utf-8").replace("max_fix_loops: 2", "max_fix_loops: 0"),
+                encoding="utf-8",
+            )
+            with FakeCliPath(reject_once=True):
+                result = ClodexWorkflow(repo).build("implement fixture", workspace_backend="local")
+            self.assertEqual(result.status, "blocked")
+            self.assertFalse(result.data["approved"])
 
     def test_malformed_plan_retries_once(self):
         with TempRepo() as repo, FakeCliPath(malformed_once=True):
@@ -202,6 +298,115 @@ class ClodexTests(unittest.TestCase):
         names = {tool["name"] for tool in response["result"]["tools"]}
         self.assertIn("clodex_build", names)
         self.assertIn("clodex_task_update", names)
+        self.assertIn("clodex_task_start", names)
+        self.assertIn("clodex_task_get", names)
+        self.assertIn("clodex_task_cancel", names)
+
+    def test_mcp_tasks_get_unknown_run(self):
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "missing"}}
+        result = subprocess.run(
+            [sys.executable, "-m", "clodex", "mcp-server"],
+            input=json.dumps(request) + "\n",
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT)},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout.splitlines()[0])
+        self.assertEqual(response["error"]["code"], -32004)
+
+    def test_task_start_get_cancel_lifecycle(self):
+        with TempRepo() as repo, FakeCliPath(sleep_seconds=1):
+            start = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "task", "start", "--workspace", "local", "slow fixture"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(start.returncode, 0, start.stdout + start.stderr)
+            run_id = json.loads(start.stdout)["run_id"]
+            cancel = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "task", "cancel", run_id],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(cancel.returncode, 0, cancel.stdout + cancel.stderr)
+            for _ in range(20):
+                status = subprocess.run(
+                    [sys.executable, "-m", "clodex", "--json", "task", "get", run_id],
+                    cwd=repo,
+                    env={**os.environ, "PYTHONPATH": str(ROOT)},
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    check=False,
+                )
+                data = json.loads(status.stdout)
+                if data["run"]["status"] in {"cancelled", "approved", "blocked"}:
+                    break
+                time.sleep(0.1)
+            self.assertIn(data["run"]["status"], {"cancel_requested", "cancelled"})
+
+    def test_hooks_print_and_ingest(self):
+        with TempRepo() as repo:
+            printed = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "hooks", "print"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(printed.returncode, 0, printed.stderr)
+            config = json.loads(printed.stdout)
+            self.assertIn("hooks", config)
+            ingested = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "hooks", "ingest", "--run-id", "run-hooks"],
+                cwd=repo,
+                input=json.dumps({"event": "SessionStart"}),
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(ingested.returncode, 0, ingested.stdout + ingested.stderr)
+
+    def test_trace_export_and_eval_run(self):
+        with TempRepo() as repo, FakeCliPath():
+            result = ClodexWorkflow(repo).build("implement fixture", workspace_backend="local")
+            exported = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "trace", "export", result.run_id, "--format", "jsonl"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(exported.returncode, 0, exported.stderr)
+            self.assertIn("run.start", exported.stdout)
+            evaluated = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "eval", "run"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(evaluated.returncode, 0, evaluated.stdout + evaluated.stderr)
 
 
 if __name__ == "__main__":

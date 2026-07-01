@@ -46,26 +46,32 @@ def claude_audit_command(config: ClodexConfig) -> AgentCommand:
     return claude_plan_command(config)
 
 
-def codex_exec_command(config: ClodexConfig, repo_root: Path) -> AgentCommand:
+def codex_exec_command(config: ClodexConfig, repo_root: Path, approval_profile: str | None = None) -> AgentCommand:
     codex = config.codex
-    return AgentCommand(
-        name="codex-build",
-        argv=[
-            "codex",
-            "exec",
-            "-m",
-            str(codex["model"]),
-            "-c",
-            f'model_reasoning_effort="{codex["reasoning_effort"]}"',
+    profile = approval_profile or str(codex.get("approval_profile", "ci"))
+    approval = "never" if profile == "ci" else "on-request"
+    argv = [
+        "codex",
+        "exec",
+        "-m",
+        str(codex["model"]),
+        "-c",
+        f'model_reasoning_effort="{codex["reasoning_effort"]}"',
+    ]
+    if profile == "auto_review":
+        argv.extend(["-c", 'approvals_reviewer="auto_review"'])
+    argv.extend(
+        [
             "--sandbox",
             str(codex["sandbox"]),
             "--ask-for-approval",
-            "never",
+            approval,
             "-C",
             str(repo_root),
             "-",
-        ],
+        ]
     )
+    return AgentCommand(name="codex-build", argv=argv)
 
 
 def codex_review_command(config: ClodexConfig) -> AgentCommand:

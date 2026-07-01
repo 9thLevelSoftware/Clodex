@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "workspace_root": ".clodex/workspaces",
     "runs_root": ".clodex/runs",
     "state_path": ".clodex/state.sqlite3",
+    "workspace": {
+        "backend": "git-worktree",
+        "apply_mode": "manual",
+    },
     "claude": {
         "model": "opus",
         "effort": "max",
@@ -21,10 +26,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "model": "gpt-5.5",
         "reasoning_effort": "xhigh",
         "sandbox": "workspace-write",
+        "approval_profile": "ci",
     },
     "audit": {
         "quorum": "unanimous",
         "personas": ["security", "performance", "portability", "test-gap"],
+        "reviewers": [
+            {"id": "claude-plan", "backend": "claude", "persona": "plan-adherence", "required": True, "timeout": 600},
+            {"id": "codex-architecture", "backend": "codex", "persona": "architecture", "required": True, "timeout": 600},
+            {"id": "security", "backend": "codex", "persona": "security", "required": False, "timeout": 600},
+            {"id": "performance", "backend": "codex", "persona": "performance", "required": False, "timeout": 600},
+            {"id": "portability", "backend": "codex", "persona": "portability", "required": False, "timeout": 600},
+            {"id": "test-gap", "backend": "claude", "persona": "test-gap", "required": False, "timeout": 600},
+        ],
+    },
+    "mcp": {
+        "async_tasks": True,
+    },
+    "tracing": {
+        "enabled": True,
     },
 }
 
@@ -52,6 +72,10 @@ class ClodexConfig:
         return self.repo_root / str(self.raw.get("state_path", DEFAULT_CONFIG["state_path"]))
 
     @property
+    def workspace(self) -> dict[str, Any]:
+        return dict(DEFAULT_CONFIG["workspace"] | self.raw.get("workspace", {}))
+
+    @property
     def claude(self) -> dict[str, Any]:
         return dict(DEFAULT_CONFIG["claude"] | self.raw.get("claude", {}))
 
@@ -62,6 +86,19 @@ class ClodexConfig:
     @property
     def audit(self) -> dict[str, Any]:
         return dict(DEFAULT_CONFIG["audit"] | self.raw.get("audit", {}))
+
+    @property
+    def reviewers(self) -> list[dict[str, Any]]:
+        reviewers = self.audit.get("reviewers", DEFAULT_CONFIG["audit"]["reviewers"])
+        return [dict(item) for item in reviewers]
+
+    @property
+    def mcp(self) -> dict[str, Any]:
+        return dict(DEFAULT_CONFIG["mcp"] | self.raw.get("mcp", {}))
+
+    @property
+    def tracing(self) -> dict[str, Any]:
+        return dict(DEFAULT_CONFIG["tracing"] | self.raw.get("tracing", {}))
 
 
 def find_repo_root(start: Path | None = None) -> Path:
@@ -123,6 +160,11 @@ def parse_minimal_yaml(text: str) -> dict[str, Any]:
 def parse_scalar(value: str) -> Any:
     if value == "":
         return ""
+    if value.startswith(("[", "{")) and value.endswith(("]", "}")):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
     lowered = value.lower()
     if lowered == "true":
         return True

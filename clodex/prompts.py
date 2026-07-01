@@ -46,11 +46,15 @@ When finished, print a concise Markdown report with:
 """
 
 
-def audit_prompt(agent_name: str, plan: dict[str, Any], diff: str, diff_hash: str) -> str:
+def audit_prompt(agent_name: str, plan: dict[str, Any], diff: str, diff_hash: str, reviewer_id: str | None = None, persona: str | None = None) -> str:
+    reviewer = reviewer_id or agent_name.lower().replace(" ", "-")
+    selected_persona = persona or agent_name
     return f"""You are the {agent_name} adversarial auditor in Clodex.
 
 Audit the diff against the accepted plan. Be strict: reject correctness bugs, missing tests, unsafe behavior, scope creep, broken CLI contracts, or unverified claims.
 
+Reviewer ID: {reviewer}
+Persona: {selected_persona}
 Diff hash: {diff_hash}
 
 Accepted plan:
@@ -65,6 +69,8 @@ Return only one JSON object:
 {{
   "approved": true,
   "diff_hash": "{diff_hash}",
+  "reviewer_id": "{reviewer}",
+  "persona": "{selected_persona}",
   "summary": "short verdict",
   "findings": [
     {{"severity": "high|medium|low", "file": "path", "line": 1, "message": "finding"}}
