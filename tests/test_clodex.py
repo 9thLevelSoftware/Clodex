@@ -322,6 +322,24 @@ class ClodexTests(unittest.TestCase):
             self.assertIsNone(run["last_actor"])
             self.assertIsNone(run["diff_hash"])
 
+    def test_approve_handoff_persists_terminal_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="claude", phase="audit", handoff_budget=2)
+            with self.assertRaises(ValueError):
+                store.approve_handoff("run-native", "")
+            approved = store.approve_handoff("run-native", "abc123", approved_by=["codex", "claude"])
+            self.assertEqual(approved["status"], "approved")
+            self.assertEqual(approved["phase"], "decision")
+            self.assertEqual(approved["diff_hash"], "abc123")
+            self.assertIsNotNone(approved["completed_at"])
+            data = store.get_handoff("run-native")
+            event = next(event for event in data["events"] if event["event"] == "handoff.approved")
+            self.assertEqual(event["data"]["diff_hash"], "abc123")
+            self.assertEqual(event["data"]["approved_by"], ["claude", "codex"])
+            with self.assertRaises(ValueError):
+                store.update_handoff("run-native", phase="fix", actor="codex")
+
     def test_handoff_update_blocked_and_failed_require_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(Path(tmp) / "state.sqlite3")
@@ -980,6 +998,90 @@ class ClodexTests(unittest.TestCase):
 
         final_data = json.loads(responses[4]["result"]["content"][0]["text"])
         self.assertTrue(any(event["event"] == "handoff.decide" for event in final_data["events"]))
+
+    def test_mcp_handoff_decide_approves_matching_claude_and_codex_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = "\n".join(
+                json.dumps(item)
+                for item in [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_create",
+                            "arguments": {"run_id": "run-approve", "task": "native task", "handoff_budget": 4},
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-approve",
+                                "phase": "audit",
+                                "actor": "claude",
+                                "diff_hash": "abc123",
+                                "report": {"approved": True, "summary": "matches plan"},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_update",
+                            "arguments": {
+                                "run_id": "run-approve",
+                                "phase": "audit",
+                                "actor": "codex",
+                                "diff_hash": "abc123",
+                                "report": {"approved": True, "summary": "implementation sound"},
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_decide", "arguments": {"run_id": "run-approve"}},
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 5,
+                        "method": "tools/call",
+                        "params": {"name": "clodex_handoff_get", "arguments": {"run_id": "run-approve"}},
+                    },
+                ]
+            ) + "\n"
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "mcp-server"],
+                input=payload,
+                cwd=tmp,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        responses = [json.loads(line) for line in result.stdout.splitlines()]
+        for response in responses[:4]:
+            self.assertFalse(response["result"]["isError"])
+        decision = json.loads(responses[3]["result"]["content"][0]["text"])
+        self.assertEqual(decision["decision"], "approved")
+        self.assertEqual(decision["diff_hash"], "abc123")
+        self.assertEqual(decision["approved_by"], ["claude", "codex"])
+
+        data = json.loads(responses[4]["result"]["content"][0]["text"])
+        self.assertEqual(data["run"]["status"], "approved")
+        self.assertEqual(data["run"]["phase"], "decision")
+        self.assertEqual(data["run"]["diff_hash"], "abc123")
+        self.assertTrue(any(event["event"] == "handoff.approved" for event in data["events"]))
+        self.assertTrue(any(event["event"] == "handoff.decide" for event in data["events"]))
 
     def test_mcp_handoff_budget_exhaustion_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:

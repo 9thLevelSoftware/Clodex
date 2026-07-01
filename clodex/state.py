@@ -374,6 +374,47 @@ class StateStore:
             self._insert_event(con, run_id, event, event_data, timestamp)
             return updated_run
 
+    def approve_handoff(self, run_id: str, diff_hash: str, approved_by: list[str] | None = None) -> dict[str, Any]:
+        normalized_diff = _reason_text(diff_hash)
+        if normalized_diff is None:
+            raise ValueError("approved handoff requires a diff hash")
+
+        actors = sorted(set(approved_by or []))
+        timestamp = now_iso()
+        with self.session() as con:
+            con.execute("begin immediate")
+            row = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"unknown run: {run_id}")
+            current = dict(row)
+            current_status = str(current["status"])
+            if current_status in TERMINAL_STATUSES and current_status != "approved":
+                raise ValueError(f"terminal run cannot be approved: {run_id} ({current_status})")
+            if current_status == "approved":
+                return current
+
+            con.execute(
+                """
+                update runs set
+                    status=?,
+                    phase=?,
+                    diff_hash=?,
+                    completed_at=coalesce(completed_at, ?),
+                    updated_at=?
+                where id=?
+                """,
+                ("approved", "decision", normalized_diff, timestamp, timestamp, run_id),
+            )
+            self._insert_event(
+                con,
+                run_id,
+                "handoff.approved",
+                {"diff_hash": normalized_diff, "approved_by": actors},
+                timestamp,
+            )
+            updated = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+            return dict(updated)
+
     def get_handoff(self, run_id: str) -> dict[str, Any] | None:
         with self.session() as con:
             row = con.execute("select * from runs where id=?", (run_id,)).fetchone()

@@ -284,6 +284,18 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 "blocked_reason": run.get("blocked_reason") or run.get("error"),
             }
             is_error = True
+        elif agreement := handoff_agreement(data):
+            try:
+                approved_run = workflow.state.approve_handoff(run["id"], agreement["diff_hash"], approved_by=agreement["approved_by"])
+            except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+                return call_text(expected_handoff_error(exc), is_error=True)
+            decision = {
+                "decision": "approved",
+                "run_id": approved_run["id"],
+                "diff_hash": approved_run.get("diff_hash"),
+                "approved_by": agreement["approved_by"],
+            }
+            is_error = False
         else:
             decision = {
                 "decision": "needs_fix",
@@ -321,6 +333,43 @@ def handoff_budget_argument(arguments: dict[str, Any]) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("handoff_budget must be an integer")
     return value
+
+
+def handoff_agreement(data: dict[str, Any]) -> dict[str, Any] | None:
+    approvals: dict[str, set[str]] = {}
+    for event in data.get("events") or []:
+        if event.get("event") != "handoff.update":
+            continue
+        event_data = event.get("data")
+        if not isinstance(event_data, dict):
+            continue
+        report = event_data.get("report")
+        if not isinstance(report, dict) or report.get("approved") is not True:
+            continue
+        actor = normalized_actor(event_data.get("actor") or report.get("actor"))
+        diff_hash = normalized_diff_hash(event_data.get("diff_hash") or report.get("diff_hash"))
+        if actor is None or diff_hash is None:
+            continue
+        approvals.setdefault(diff_hash, set()).add(actor)
+
+    for diff_hash, actors in approvals.items():
+        if {"claude", "codex"}.issubset(actors):
+            return {"diff_hash": diff_hash, "approved_by": sorted(actors)}
+    return None
+
+
+def normalized_actor(value: Any) -> str | None:
+    if value is None:
+        return None
+    actor = str(value).strip().lower()
+    return actor if actor in {"claude", "codex"} else None
+
+
+def normalized_diff_hash(value: Any) -> str | None:
+    if value is None:
+        return None
+    diff_hash = str(value).strip()
+    return diff_hash or None
 
 
 def expected_handoff_error(exc: Exception) -> str:
