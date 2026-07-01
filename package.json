@@ -5,12 +5,12 @@
   "license": "UNLICENSED",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/9thLevelSoftware/Climi.git"
+    "url": "git+https://github.com/9thLevelSoftware/Clodex.git"
   },
-  "homepage": "https://github.com/9thLevelSoftware/Climi#readme",
+  "homepage": "https://github.com/9thLevelSoftware/Clodex#readme",
   "bugs": {
-    "url": "https://github.com/9thLevelSoftware/Climi/issues"
-  },
+    "url": "https://github.com/9thLevelSoftware/Clodex/issues"
+  }
   "type": "commonjs",
   "keywords": [
     "claude-code",
