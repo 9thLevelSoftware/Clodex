@@ -1,7 +1,8 @@
 # Clodex
 
-Clodex is a local-first workflow system for **Claude Code CLI** and **Codex CLI**.
-It defines a two-agent contract:
+Clodex is a native collaboration layer for **Claude Code CLI** and **Codex CLI**.
+It installs repo instructions and MCP tools that let either agent hand work to
+the other without the user manually driving every step.
 
 - **Claude Code** plans first with Opus at max effort.
 - **Codex** implements from that accepted plan with GPT-5.5 at xhigh reasoning.
@@ -12,6 +13,39 @@ Clodex borrows practical patterns from Symphony-style workflow contracts,
 Chorus-style adversarial review, Openroom-style local rooms/artifacts, and
 Claude Teams-style task ledgers. It does not require a cloud service, public
 relay, tmux, or a third-party model delegate.
+
+## Native Claude/Codex Collaboration
+
+```bash
+npm install -g clodex
+clodex init
+```
+
+Use Claude Code or Codex as usual. Clodex adds repo instructions and MCP tools
+that teach each agent how to coordinate with the other: Claude plans, Codex
+implements, both audit, and Clodex enforces durable handoff state and bounded
+agreement.
+
+`clodex init` writes managed Clodex blocks to `CLAUDE.md`, `AGENTS.md`, and
+`CLODEX.md`. By default it also configures the repo MCP server through
+`.mcp.json` and `.codex/config.toml`; use `--no-mcp-config` when you want
+instructions only.
+
+Native coordination uses these MCP tools:
+
+- `clodex_handoff_create`
+- `clodex_handoff_update`
+- `clodex_handoff_get`
+- `clodex_handoff_decide`
+
+If MCP is unavailable, use the CLI fallbacks:
+
+```bash
+clodex task start "<task>"
+clodex task get <run-id>
+clodex audit --diff
+clodex status
+```
 
 ## Requirements
 
@@ -31,15 +65,16 @@ codex login
 
 API keys or long-lived tokens are fallback-only for CI/headless automation.
 
-## Quick Start
+## Harness Commands
+
+The native workflow is the default developer experience. The command harness
+remains available for scripted, CI, dry-run, and non-MCP workflows.
+
+Install from source:
 
 ```bash
 ./install.sh --dry-run
 ./install.sh --force
-clodex doctor
-clodex plan --dry-run "Add a small feature"
-clodex build "Add a small feature"
-clodex apply <run-id>
 ```
 
 Install with npm:
@@ -59,6 +94,7 @@ From this checkout without installing:
 
 ```bash
 python -m clodex doctor
+python -m clodex init --dry-run
 python -m clodex build --dry-run "Add a small feature"
 ```
 
@@ -66,13 +102,15 @@ PowerShell:
 
 ```powershell
 .\clodex.ps1 doctor
+.\clodex.ps1 init --dry-run
 .\clodex.ps1 build --dry-run "Add a small feature"
 ```
 
-## Commands
-
 | Command | Purpose |
 | --- | --- |
+| `clodex init` | Install native Claude/Codex instructions and MCP config |
+| `clodex native status` | Show native instruction and MCP config state |
+| `clodex native doctor` | Run native setup checks, CLI readiness, and launcher checks |
 | `clodex doctor` | Check Python, git, Claude Code, Codex, and `CLODEX.md` |
 | `clodex plan "<task>"` | Run Claude planning only |
 | `clodex build "<task>"` | Run plan, implementation, and dual audit loop in an isolated worktree |
@@ -140,6 +178,10 @@ The MCP server exposes:
 - `clodex_task_start`
 - `clodex_task_get`
 - `clodex_task_cancel`
+- `clodex_handoff_create`
+- `clodex_handoff_update`
+- `clodex_handoff_get`
+- `clodex_handoff_decide`
 
 The server also handles MCP-style `tasks/get`, `tasks/update`, and
 `tasks/cancel` JSON-RPC methods using the Clodex `run_id` as the task id.

@@ -1,7 +1,7 @@
 {
   "name": "clodex",
   "version": "0.1.0",
-  "description": "Local Claude Code CLI and Codex CLI workflow orchestration",
+  "description": "Native Claude Code and Codex collaboration for local-first agent workflows",
   "license": "UNLICENSED",
   "repository": {
     "type": "git",
@@ -12,6 +12,14 @@
     "url": "https://github.com/9thLevelSoftware/Climi/issues"
   },
   "type": "commonjs",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "mcp",
+    "agent-harness",
+    "developer-tools",
+    "ai"
+  ],
   "bin": {
     "clodex": "npm/clodex.js",
     "clodex-mcp-server": "npm/clodex-mcp-server.js"
