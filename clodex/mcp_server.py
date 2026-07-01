@@ -317,7 +317,10 @@ def required_argument(arguments: dict[str, Any], key: str) -> Any:
 def handoff_budget_argument(arguments: dict[str, Any]) -> int:
     if "handoff_budget" not in arguments or arguments["handoff_budget"] is None:
         return 6
-    return int(arguments["handoff_budget"])
+    value = arguments["handoff_budget"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("handoff_budget must be an integer")
+    return value
 
 
 def expected_handoff_error(exc: Exception) -> str:

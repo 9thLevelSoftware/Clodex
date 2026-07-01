@@ -1115,7 +1115,7 @@ class ClodexTests(unittest.TestCase):
         self.assertEqual(response["id"], 41)
         self.assertNotIn("error", response)
         self.assertTrue(response["result"]["isError"])
-        self.assertIn("not-an-int", response["result"]["content"][0]["text"])
+        self.assertEqual(response["result"]["content"][0]["text"], "handoff_budget must be an integer")
 
     def test_mcp_handoff_create_negative_budget_returns_tool_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1144,6 +1144,49 @@ class ClodexTests(unittest.TestCase):
         self.assertNotIn("error", response)
         self.assertTrue(response["result"]["isError"])
         self.assertIn("handoff_budget must be non-negative", response["result"]["content"][0]["text"])
+
+    def test_mcp_handoff_create_rejects_bool_and_float_budgets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = "\n".join(
+                json.dumps(item)
+                for item in [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 49,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_create",
+                            "arguments": {"run_id": "run-bool-budget", "task": "native task", "handoff_budget": True},
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 50,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "clodex_handoff_create",
+                            "arguments": {"run_id": "run-float-budget", "task": "native task", "handoff_budget": 1.5},
+                        },
+                    },
+                ]
+            ) + "\n"
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "mcp-server"],
+                input=payload,
+                cwd=tmp,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        responses = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual({response["id"] for response in responses}, {49, 50})
+        for response in responses:
+            self.assertNotIn("error", response)
+            self.assertTrue(response["result"]["isError"])
+            self.assertEqual(response["result"]["content"][0]["text"], "handoff_budget must be an integer")
 
     def test_mcp_handoff_create_duplicate_run_id_returns_tool_error(self):
         with tempfile.TemporaryDirectory() as tmp:
