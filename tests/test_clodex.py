@@ -342,6 +342,8 @@ class ClodexTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(Path(tmp) / "state.sqlite3")
             store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=2)
+            initial = store.get_handoff("run-native")
+            self.assertEqual(initial["next_expected_actor"], "claude")
             store.add_artifact("run-native", "plan", "/tmp/plan.json", "json")
             store.update_handoff("run-native", phase="implementation", actor="claude", report={"summary": "ready"})
             data = store.get_handoff("run-native")
@@ -349,6 +351,16 @@ class ClodexTests(unittest.TestCase):
             self.assertEqual(data["run"]["phase"], "implementation")
             self.assertEqual(data["artifacts"][0]["name"], "plan")
             self.assertGreaterEqual(len(data["events"]), 1)
+            self.assertEqual(data["next_expected_actor"], "codex")
+
+    def test_handoff_get_uses_owner_before_any_actor_has_acted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="codex", phase="planning", handoff_budget=2)
+            data = store.get_handoff("run-native")
+            self.assertEqual(data["run"]["owner"], "codex")
+            self.assertIsNone(data["run"]["last_actor"])
+            self.assertEqual(data["next_expected_actor"], "codex")
 
     def test_trace_writer_appends_jsonl_events(self):
         with tempfile.TemporaryDirectory() as tmp:

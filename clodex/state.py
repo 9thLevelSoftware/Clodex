@@ -366,7 +366,13 @@ class StateStore:
             artifacts = [dict(artifact) for artifact in con.execute("select * from artifacts where run_id=? order by id", (run_id,))]
             handoff_count = _int_or_default(run.get("handoff_count"), 0)
             handoff_budget = _int_or_default(run.get("handoff_budget"), 6)
-            next_expected_actor = "codex" if run.get("last_actor") == "claude" else "claude"
+            last_actor = run.get("last_actor")
+            if last_actor == "claude":
+                next_expected_actor = "codex"
+            elif last_actor == "codex":
+                next_expected_actor = "claude"
+            else:
+                next_expected_actor = run.get("owner") or "claude"
             return {
                 "run": run,
                 "events": events,
