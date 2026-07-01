@@ -263,6 +263,173 @@ class ClodexTests(unittest.TestCase):
             self.assertTrue(data["claude"]["ok"])
             self.assertTrue(data["codex"]["ok"])
 
+    def test_cli_init_dry_run_does_not_write_files(self):
+        with TempRepo() as repo:
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "init", "--dry-run"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["dry_run"])
+            self.assertFalse((repo / "CLAUDE.md").exists())
+            self.assertTrue(any(Path(item["path"]).name == "CLAUDE.md" for item in data["files"]))
+
+    def test_cli_init_writes_native_files_and_preserves_user_content(self):
+        with TempRepo() as repo:
+            (repo / "CLAUDE.md").write_text("user header\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "init"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            claude = (repo / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertTrue(claude.startswith("user header\n"))
+            self.assertIn(BEGIN_MARKER, claude)
+            self.assertTrue((repo / "AGENTS.md").exists())
+            self.assertTrue((repo / ".mcp.json").exists())
+            self.assertTrue((repo / ".codex" / "config.toml").exists())
+
+    def test_cli_init_no_mcp_config_writes_only_instruction_files(self):
+        with TempRepo() as repo:
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "init", "--no-mcp-config"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((repo / "CLAUDE.md").exists())
+            self.assertFalse((repo / ".mcp.json").exists())
+            self.assertFalse((repo / ".codex" / "config.toml").exists())
+
+    def test_cli_init_rejects_blocked_codex_parent_without_partial_writes(self):
+        with TempRepo() as repo:
+            clodex_before = (repo / "CLODEX.md").read_bytes()
+            (repo / ".codex").write_text("not a directory\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "init"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["ok"])
+            self.assertIn(".codex", data["error"])
+            self.assertFalse((repo / "CLAUDE.md").exists())
+            self.assertFalse((repo / "AGENTS.md").exists())
+            self.assertFalse((repo / ".mcp.json").exists())
+            self.assertTrue((repo / ".codex").is_file())
+            self.assertEqual((repo / "CLODEX.md").read_bytes(), clodex_before)
+
+    def test_cli_native_status_reports_current_and_missing_components(self):
+        with TempRepo() as repo:
+            subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "init"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+            status = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "native", "status"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+            data = json.loads(status.stdout)
+            self.assertTrue(data["ok"])
+            statuses = {Path(item["path"]).name: item["status"] for item in data["files"]}
+            self.assertEqual(statuses["CLAUDE.md"], "current")
+
+    def test_cli_native_status_reports_invalid_malformed_block(self):
+        with TempRepo() as repo:
+            (repo / "CLAUDE.md").write_text("header\n<!-- BEGIN CLODEX -->\nmissing end\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "native", "status", "--no-mcp-config"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["ok"])
+            statuses = {Path(item["path"]).name: item["status"] for item in data["files"]}
+            self.assertEqual(statuses["CLAUDE.md"], "invalid")
+
+    def test_cli_native_status_reports_blocked_config_parent(self):
+        with TempRepo() as repo:
+            (repo / ".codex").write_text("not a directory\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "native", "status"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["ok"])
+            item = next(item for item in data["files"] if Path(item["path"]).name == "config.toml")
+            self.assertEqual(item["status"], "invalid")
+            self.assertEqual(item["action"], "error")
+            self.assertIn(".codex", item["error"])
+
+    def test_cli_native_doctor_combines_doctor_and_native_status(self):
+        with TempRepo() as repo, FakeCliPath():
+            subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "init"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "native", "doctor"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["ok"])
+            self.assertTrue(data["doctor"]["claude"]["ok"])
+            self.assertTrue(data["doctor"]["codex"]["ok"])
+            self.assertIn("npm_launcher", data)
+
     def test_build_happy_path_creates_agreement(self):
         with TempRepo() as repo, FakeCliPath():
             result = ClodexWorkflow(repo).build("implement fixture", workspace_backend="local")

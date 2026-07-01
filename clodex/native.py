@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .doctor import run_doctor
 
 
 BEGIN_MARKER = "<!-- BEGIN CLODEX -->"
@@ -348,26 +352,106 @@ def apply_native_install(
     return plan
 
 
+def native_status(
+    repo_root: Path,
+    *,
+    global_mode: bool = False,
+    no_mcp_config: bool = False,
+    force: bool = False,
+) -> dict[str, Any]:
+    plan = plan_native_install(
+        repo_root,
+        dry_run=True,
+        global_mode=global_mode,
+        no_mcp_config=no_mcp_config,
+        force=force,
+    )
+    files = [_status_entry(item) for item in plan["files"]]
+    _mark_preflight_conflicts(files, plan["files"])
+    ok = all(item["status"] == "current" and item["action"] == "unchanged" for item in files)
+    return {
+        "ok": ok,
+        "mode": plan["mode"],
+        "root": plan["root"],
+        "files": files,
+    }
+
+
+def native_doctor(
+    repo_root: Path,
+    *,
+    global_mode: bool = False,
+    no_mcp_config: bool = False,
+    force: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    native = native_status(
+        repo_root,
+        global_mode=global_mode,
+        no_mcp_config=no_mcp_config,
+        force=force,
+    )
+    doctor_code, doctor = run_doctor(repo_root)
+    npm_launcher = shutil.which("clodex") or shutil.which("clodex.cmd") or shutil.which("clodex.ps1")
+    data = {
+        "ok": native["ok"] and doctor_code == 0,
+        "native": native,
+        "doctor": doctor,
+        "npm_launcher": {"ok": npm_launcher is not None, "path": npm_launcher},
+        "python": {
+            "ok": sys.version_info >= (3, 12),
+            "executable": sys.executable,
+            "version": sys.version.split()[0],
+        },
+    }
+    return (0 if data["ok"] else 1), data
+
+
+def _status_entry(item: dict[str, Any]) -> dict[str, Any]:
+    entry = {
+        "path": item["path"],
+        "action": item["action"],
+        "status": item["status"],
+    }
+    if "error" in item:
+        entry["error"] = item["error"]
+    return entry
+
+
+def _mark_preflight_conflicts(status_files: list[dict[str, Any]], plan_files: list[dict[str, Any]]) -> None:
+    for conflict_path, message in _native_write_conflicts(plan_files):
+        for item in status_files:
+            path = Path(item["path"])
+            if path == conflict_path or conflict_path in path.parents:
+                item["action"] = "error"
+                item["status"] = "invalid"
+                item["error"] = message
+
+
 def _read_text_preserve_newlines(path: Path) -> str:
     with path.open("r", encoding="utf-8", newline="") as handle:
         return handle.read()
 
 
 def _preflight_native_writes(files: list[dict[str, Any]]) -> None:
-    conflicts: list[str] = []
+    conflicts = [message for _path, message in _native_write_conflicts(files)]
+    if conflicts:
+        raise ManagedBlockError("Cannot apply native install because target paths are blocked: " + "; ".join(conflicts))
+
+
+def _native_write_conflicts(files: list[dict[str, Any]]) -> list[tuple[Path, str]]:
+    conflicts: list[tuple[Path, str]] = []
     for item in files:
-        if item["action"] == "unchanged":
+        if item["action"] in {"unchanged", "error"}:
             continue
         path = Path(item["path"])
         if path.exists() and path.is_dir():
-            conflicts.append(f"{path} is a directory")
+            conflicts.append((path, f"{path} is a directory"))
             continue
         for ancestor in path.parents:
             if ancestor.exists() and not ancestor.is_dir():
-                conflicts.append(f"{ancestor} is not a directory")
+                conflicts.append((ancestor, f"{ancestor} is not a directory"))
                 break
-    if conflicts:
-        raise ManagedBlockError("Cannot apply native install because target paths are blocked: " + "; ".join(conflicts))
+    return conflicts
 
 
 def _has_unmanaged_codex_mcp_table(existing: str) -> bool:
