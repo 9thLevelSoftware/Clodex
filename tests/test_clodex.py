@@ -364,6 +364,23 @@ class ClodexTests(unittest.TestCase):
             self.assertTrue(data["ok"])
             statuses = {Path(item["path"]).name: item["status"] for item in data["files"]}
             self.assertEqual(statuses["CLAUDE.md"], "current")
+            (repo / "AGENTS.md").unlink()
+            missing_status = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "native", "status"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(missing_status.returncode, 1, missing_status.stdout + missing_status.stderr)
+            missing_data = json.loads(missing_status.stdout)
+            self.assertFalse(missing_data["ok"])
+            files = {Path(item["path"]).name: item for item in missing_data["files"]}
+            self.assertEqual(files["CLAUDE.md"]["status"], "current")
+            self.assertEqual(files["AGENTS.md"]["status"], "missing")
+            self.assertEqual(files["AGENTS.md"]["action"], "create")
 
     def test_cli_native_status_reports_invalid_malformed_block(self):
         with TempRepo() as repo:
