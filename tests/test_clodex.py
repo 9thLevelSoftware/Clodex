@@ -36,6 +36,15 @@ from clodex.workspace import DirtyWorkspaceError, WorkspaceManager
 
 
 ROOT = Path(__file__).resolve().parents[1]
+BUNDLED_PYTHON = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "python" / "python.exe"
+
+
+def cli_test_python() -> str | None:
+    if BUNDLED_PYTHON.exists():
+        return str(BUNDLED_PYTHON)
+    if sys.version_info >= (3, 12):
+        return sys.executable
+    return None
 
 
 class TempRepo:
@@ -460,9 +469,12 @@ class ClodexTests(unittest.TestCase):
             self.assertIn(".codex", item["error"])
 
     def test_cli_native_doctor_combines_doctor_and_native_status(self):
+        python = cli_test_python()
+        if python is None:
+            self.skipTest("native doctor CLI test requires Python 3.12+")
         with TempRepo() as repo, FakeCliPath(include_clodex=True):
             subprocess.run(
-                [sys.executable, "-m", "clodex", "--json", "init"],
+                [python, "-m", "clodex", "--json", "init"],
                 cwd=repo,
                 env={**os.environ, "PYTHONPATH": str(ROOT)},
                 capture_output=True,
@@ -471,7 +483,7 @@ class ClodexTests(unittest.TestCase):
                 check=True,
             )
             result = subprocess.run(
-                [sys.executable, "-m", "clodex", "--json", "native", "doctor"],
+                [python, "-m", "clodex", "--json", "native", "doctor"],
                 cwd=repo,
                 env={**os.environ, "PYTHONPATH": str(ROOT)},
                 capture_output=True,
@@ -485,6 +497,35 @@ class ClodexTests(unittest.TestCase):
             self.assertTrue(data["doctor"]["claude"]["ok"])
             self.assertTrue(data["doctor"]["codex"]["ok"])
             self.assertTrue(data["npm_launcher"]["ok"])
+
+    def test_node_launcher_native_doctor_sets_launcher_env(self):
+        python = cli_test_python()
+        if python is None:
+            self.skipTest("node launcher native doctor test requires Python 3.12+")
+        with TempRepo() as repo, FakeCliPath():
+            subprocess.run(
+                [python, "-m", "clodex", "--json", "init"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+            result = subprocess.run(
+                ["node", str(ROOT / "npm" / "clodex.js"), "--json", "native", "doctor"],
+                cwd=repo,
+                env={**os.environ, "CLODEX_PYTHON": python},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["ok"])
+            self.assertTrue(data["npm_launcher"]["ok"])
+            self.assertEqual(Path(data["npm_launcher"]["path"]).resolve(), (ROOT / "npm" / "clodex.js").resolve())
 
     def test_native_doctor_fails_when_npm_launcher_missing(self):
         from clodex.native import native_doctor
@@ -507,7 +548,17 @@ class ClodexTests(unittest.TestCase):
                     return None
                 return original_which(command, *args, **kwargs)
 
-            with mock.patch("clodex.native.shutil.which", side_effect=without_clodex):
+            doctor = {
+                "ok": True,
+                "repo_root": str(repo),
+                "claude": {"ok": True},
+                "codex": {"ok": True},
+            }
+            with (
+                mock.patch("clodex.native.run_doctor", return_value=(0, doctor)) as run_doctor,
+                mock.patch("clodex.native.shutil.which", side_effect=without_clodex),
+                mock.patch.dict(os.environ, {"CLODEX_NPM_LAUNCHER": ""}),
+            ):
                 exit_code, data = native_doctor(repo)
 
             self.assertNotEqual(exit_code, 0)
@@ -516,6 +567,32 @@ class ClodexTests(unittest.TestCase):
             self.assertTrue(data["native"]["ok"])
             self.assertTrue(data["doctor"]["claude"]["ok"])
             self.assertTrue(data["doctor"]["codex"]["ok"])
+            self.assertIn("reason", data["npm_launcher"])
+            run_doctor.assert_called_once_with(repo)
+
+    def test_native_doctor_global_mode_uses_home_for_doctor_root(self):
+        from clodex.native import native_doctor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            launcher = home / "clodex.js"
+            launcher.write_text("// fake launcher\n", encoding="utf-8")
+            doctor = {
+                "ok": True,
+                "repo_root": str(home),
+                "claude": {"ok": True},
+                "codex": {"ok": True},
+            }
+            with (
+                mock.patch("clodex.native.Path.home", return_value=home),
+                mock.patch("clodex.native.run_doctor", return_value=(0, doctor)) as run_doctor,
+                mock.patch("clodex.native._npm_launcher_status", return_value={"ok": True, "path": str(launcher)}),
+            ):
+                _exit_code, data = native_doctor(Path("repo"), global_mode=True)
+
+            self.assertEqual(data["native"]["root"], str(home))
+            self.assertEqual(data["doctor"]["repo_root"], str(home))
+            run_doctor.assert_called_once_with(home)
 
     def test_build_happy_path_creates_agreement(self):
         with TempRepo() as repo, FakeCliPath():

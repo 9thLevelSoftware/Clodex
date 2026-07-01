@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tomllib
@@ -390,9 +391,8 @@ def native_doctor(
         no_mcp_config=no_mcp_config,
         force=force,
     )
-    doctor_code, doctor = run_doctor(repo_root)
-    npm_launcher = shutil.which("clodex") or shutil.which("clodex.cmd") or shutil.which("clodex.ps1")
-    npm_launcher_status = {"ok": npm_launcher is not None, "path": npm_launcher}
+    doctor_code, doctor = run_doctor(Path(native["root"]))
+    npm_launcher_status = _npm_launcher_status()
     data = {
         "ok": native["ok"] and doctor_code == 0 and npm_launcher_status["ok"],
         "native": native,
@@ -405,6 +405,26 @@ def native_doctor(
         },
     }
     return (0 if data["ok"] else 1), data
+
+
+def _npm_launcher_status() -> dict[str, Any]:
+    env_launcher = os.environ.get("CLODEX_NPM_LAUNCHER")
+    env_error: str | None = None
+    if env_launcher:
+        env_path = Path(env_launcher)
+        if env_path.exists():
+            return {"ok": True, "path": str(env_path)}
+        env_error = f"CLODEX_NPM_LAUNCHER does not exist: {env_launcher}"
+
+    launcher = shutil.which("clodex") or shutil.which("clodex.cmd") or shutil.which("clodex.ps1")
+    if launcher is not None:
+        return {"ok": True, "path": launcher}
+
+    return {
+        "ok": False,
+        "path": None,
+        "reason": env_error or "No clodex launcher found on PATH and CLODEX_NPM_LAUNCHER is not set",
+    }
 
 
 def _status_entry(item: dict[str, Any]) -> dict[str, Any]:

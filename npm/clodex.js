@@ -22,6 +22,7 @@ function candidates() {
 function envWithPythonPath() {
   const env = { ...process.env };
   env.PYTHONPATH = packageRoot + (env.PYTHONPATH ? path.delimiter + env.PYTHONPATH : "");
+  env.CLODEX_NPM_LAUNCHER = __filename;
   return env;
 }
 
