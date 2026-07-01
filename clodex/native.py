@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 BEGIN_MARKER = "<!-- BEGIN CLODEX -->"
@@ -106,6 +108,151 @@ clodex audit --diff
 clodex status
 ```
 """
+
+
+def clodex_mcp_server_entry() -> dict[str, Any]:
+    return {"command": "clodex", "args": ["mcp-server"]}
+
+
+def render_mcp_json(existing: str, *, force: bool = False) -> str:
+    text = existing.strip()
+    if not text:
+        data: dict[str, Any] = {}
+    else:
+        try:
+            data = json.loads(existing)
+        except json.JSONDecodeError as exc:
+            if not force:
+                raise ManagedBlockError(f"Invalid .mcp.json: {exc}") from exc
+            data = {}
+    if not isinstance(data, dict):
+        if not force:
+            raise ManagedBlockError(".mcp.json root must be an object")
+        data = {}
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+        data["mcpServers"] = servers
+    servers["clodex"] = clodex_mcp_server_entry()
+    return json.dumps(data, indent=2, sort_keys=True) + "\n"
+
+
+def codex_mcp_block() -> str:
+    return """[mcp_servers.clodex]
+command = "clodex"
+args = ["mcp-server"]
+"""
+
+
+def render_codex_toml(existing: str, *, force: bool = False) -> str:
+    return replace_toml_managed_block(existing, codex_mcp_block(), force=force)[0]
+
+
+def build_clodex_policy_block() -> str:
+    return """# Native Mode
+
+Clodex native mode is enabled for this repository.
+
+- Use MCP handoff tools as the primary coordination channel.
+- Keep Claude Code as strategist by default and Codex as engineer by default.
+- Require agreement before reporting non-trivial implementation work as complete.
+- Use CLI fallbacks only when MCP is unavailable.
+"""
+
+
+def repo_native_targets(repo_root: Path, *, no_mcp_config: bool = False) -> list[tuple[Path, str, str]]:
+    targets = [
+        (repo_root / "CLAUDE.md", "managed", build_claude_block()),
+        (repo_root / "AGENTS.md", "managed", build_agents_block()),
+        (repo_root / "CLODEX.md", "managed", build_clodex_policy_block()),
+    ]
+    if not no_mcp_config:
+        targets.extend(
+            [
+                (repo_root / ".mcp.json", "json", ""),
+                (repo_root / ".codex" / "config.toml", "toml", ""),
+            ]
+        )
+    return targets
+
+
+def target_status(path: Path, desired: str) -> str:
+    if not path.exists():
+        return "missing"
+    try:
+        current = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return "invalid"
+    return "current" if current == desired else "stale"
+
+
+def _planned_content(path: Path, kind: str, body: str, *, force: bool) -> str:
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if kind == "managed":
+        return replace_managed_block(existing, body, force=force)[0]
+    if kind == "json":
+        return render_mcp_json(existing, force=force)
+    if kind == "toml":
+        return render_codex_toml(existing, force=force)
+    raise ValueError(f"unknown native target kind: {kind}")
+
+
+def plan_native_install(
+    repo_root: Path,
+    *,
+    dry_run: bool = False,
+    global_mode: bool = False,
+    no_mcp_config: bool = False,
+    force: bool = False,
+) -> dict[str, Any]:
+    target_root = Path.home() if global_mode else repo_root
+    files: list[dict[str, Any]] = []
+    for path, kind, body in repo_native_targets(target_root, no_mcp_config=no_mcp_config):
+        content = _planned_content(path, kind, body, force=force)
+        status = target_status(path, content)
+        if status == "missing":
+            action = "create"
+        elif status == "current":
+            action = "unchanged"
+        else:
+            action = "update"
+        files.append(
+            {
+                "path": str(path),
+                "action": action,
+                "status": status,
+                "preview": content,
+            }
+        )
+    return {
+        "mode": "global" if global_mode else "repo",
+        "dry_run": dry_run,
+        "root": str(target_root),
+        "files": files,
+    }
+
+
+def apply_native_install(
+    repo_root: Path,
+    *,
+    global_mode: bool = False,
+    no_mcp_config: bool = False,
+    force: bool = False,
+) -> dict[str, Any]:
+    plan = plan_native_install(
+        repo_root,
+        dry_run=False,
+        global_mode=global_mode,
+        no_mcp_config=no_mcp_config,
+        force=force,
+    )
+    for item in plan["files"]:
+        path = Path(item["path"])
+        if item["action"] == "unchanged":
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(item["preview"], encoding="utf-8", newline="\n")
+    return plan
 
 
 def _replace_managed_block(

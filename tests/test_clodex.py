@@ -504,6 +504,12 @@ class ClodexTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(updated, "header\n# BEGIN CLODEX\nnew\n# END CLODEX\n")
 
+    def test_replace_toml_managed_block_preserves_crlf_style(self):
+        existing = "header\r\n# BEGIN CLODEX\r\nold\r\n# END CLODEX\r\nfooter\r\n"
+        updated, changed = replace_toml_managed_block(existing, "new\n")
+        self.assertTrue(changed)
+        self.assertEqual(updated, "header\r\n# BEGIN CLODEX\r\nnew\r\n# END CLODEX\r\nfooter\r\n")
+
     def test_native_instruction_templates_include_mcp_and_cli_fallbacks(self):
         claude = build_claude_block()
         agents = build_agents_block()
@@ -514,6 +520,59 @@ class ClodexTests(unittest.TestCase):
         self.assertIn("clodex_handoff_update", agents)
         self.assertIn("Claude Code is the default strategist", agents)
         self.assertIn("handoff budget", agents)
+
+    def test_native_plan_dry_run_previews_instruction_and_mcp_files(self):
+        from clodex.native import plan_native_install
+
+        with TempRepo() as repo:
+            plan = plan_native_install(repo, dry_run=True)
+        paths = {Path(item["path"]).name for item in plan["files"]}
+        self.assertIn("CLAUDE.md", paths)
+        self.assertIn("AGENTS.md", paths)
+        self.assertIn("CLODEX.md", paths)
+        self.assertIn(".mcp.json", paths)
+        self.assertIn("config.toml", paths)
+        self.assertTrue(plan["dry_run"])
+        self.assertTrue(any("clodex_handoff_create" in item["preview"] for item in plan["files"]))
+
+    def test_native_plan_no_mcp_config_skips_mcp_files(self):
+        from clodex.native import plan_native_install
+
+        with TempRepo() as repo:
+            plan = plan_native_install(repo, dry_run=True, no_mcp_config=True)
+        paths = {str(Path(item["path"]).as_posix()) for item in plan["files"]}
+        self.assertFalse(any(path.endswith(".mcp.json") for path in paths))
+        self.assertFalse(any(path.endswith(".codex/config.toml") for path in paths))
+
+    def test_render_mcp_json_preserves_existing_servers(self):
+        from clodex.native import render_mcp_json
+
+        rendered = render_mcp_json('{"mcpServers":{"existing":{"command":"node","args":["server.js"]}}}')
+        data = json.loads(rendered)
+        self.assertEqual(data["mcpServers"]["existing"]["command"], "node")
+        self.assertEqual(data["mcpServers"]["clodex"]["command"], "clodex")
+        self.assertEqual(data["mcpServers"]["clodex"]["args"], ["mcp-server"])
+
+    def test_render_mcp_json_rejects_invalid_json_without_force(self):
+        from clodex.native import render_mcp_json
+
+        with self.assertRaises(ManagedBlockError):
+            render_mcp_json("{not-json")
+
+    def test_render_mcp_json_force_replaces_invalid_json(self):
+        from clodex.native import render_mcp_json
+
+        data = json.loads(render_mcp_json("{not-json", force=True))
+        self.assertEqual(data["mcpServers"]["clodex"]["command"], "clodex")
+
+    def test_render_codex_toml_preserves_existing_config(self):
+        from clodex.native import render_codex_toml
+
+        rendered = render_codex_toml('model = "gpt-5.5"\n')
+        self.assertIn('model = "gpt-5.5"', rendered)
+        self.assertIn("[mcp_servers.clodex]", rendered)
+        self.assertIn('command = "clodex"', rendered)
+        self.assertIn('args = ["mcp-server"]', rendered)
 
 
 if __name__ == "__main__":
