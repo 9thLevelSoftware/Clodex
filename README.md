@@ -39,6 +39,7 @@ API keys or long-lived tokens are fallback-only for CI/headless automation.
 clodex doctor
 clodex plan --dry-run "Add a small feature"
 clodex build "Add a small feature"
+clodex apply <run-id>
 ```
 
 From this checkout without installing:
@@ -61,9 +62,14 @@ PowerShell:
 | --- | --- |
 | `clodex doctor` | Check Python, git, Claude Code, Codex, and `CLODEX.md` |
 | `clodex plan "<task>"` | Run Claude planning only |
-| `clodex build "<task>"` | Run plan, implementation, and dual audit loop |
+| `clodex build "<task>"` | Run plan, implementation, and dual audit loop in an isolated worktree |
 | `clodex audit --diff` | Audit current uncommitted changes |
 | `clodex run "<task>"` | Alias for `build` |
+| `clodex apply <run-id>` | Apply an approved worktree patch back to the source checkout |
+| `clodex task start/get/cancel/list` | Manage durable async runs |
+| `clodex trace export <run-id>` | Print a run trace as JSONL |
+| `clodex hooks print/install/ingest` | Generate or ingest Claude Code hook events |
+| `clodex eval run` | Run local harness smoke evals |
 | `clodex queue add/list/update` | Manage the local task ledger |
 | `clodex status` | Show recent tasks and runs |
 | `clodex mcp-server` | Run the stdio MCP server |
@@ -82,6 +88,10 @@ codex:
   model: gpt-5.5
   reasoning_effort: xhigh
   sandbox: workspace-write
+  approval_profile: ci
+workspace:
+  backend: git-worktree
+  apply_mode: manual
 max_fix_loops: 2
 ```
 
@@ -93,8 +103,16 @@ Run artifacts are written to `.clodex/runs/<run-id>/`:
 - `04-codex-audit.json`
 - `05-agreement.json`
 - `changes.diff`
+- `apply.patch`
+- `trace.jsonl`
+- `workspace.json`
+- `reviewers/*.json`
 
 Local task/run state is stored in `.clodex/state.sqlite3`.
+
+By default, `clodex build` executes inside `.clodex/workspaces/<run-id>/`.
+The source checkout is not modified until `clodex apply <run-id>` succeeds.
+Use `--workspace local` for compatibility with the earlier in-place behavior.
 
 ## MCP Tools
 
@@ -106,6 +124,12 @@ The MCP server exposes:
 - `clodex_status`
 - `clodex_task_create`
 - `clodex_task_update`
+- `clodex_task_start`
+- `clodex_task_get`
+- `clodex_task_cancel`
+
+The server also handles MCP-style `tasks/get`, `tasks/update`, and
+`tasks/cancel` JSON-RPC methods using the Clodex `run_id` as the task id.
 
 Start it with:
 
@@ -115,7 +139,7 @@ python -m clodex mcp-server
 
 ## Safety
 
-Clodex defaults to Codex `workspace-write` sandboxing and Claude plan mode.
-Dangerous full-access workflows are intentionally not the default. A run is
-complete only when `05-agreement.json` has `approved: true` for the final diff
-hash.
+Clodex defaults to git worktree isolation, Codex `workspace-write` sandboxing,
+and Claude plan mode. Dangerous full-access workflows are intentionally not the
+default. A run is complete only when `05-agreement.json` has `approved: true`
+for the final diff hash.

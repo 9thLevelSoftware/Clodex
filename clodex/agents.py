@@ -24,7 +24,7 @@ class AgentRunner:
     def __init__(self, repo_root: Path):
         self.repo_root = repo_root
 
-    def run(self, command: AgentCommand, prompt: str) -> AgentResult:
+    def run(self, command: AgentCommand, prompt: str, timeout: int | None = None) -> AgentResult:
         argv = list(command.argv)
         resolved = shutil.which(argv[0])
         if resolved:
@@ -38,6 +38,7 @@ class AgentRunner:
             encoding="utf-8",
             errors="replace",
             check=False,
+            timeout=timeout,
         )
         return AgentResult(
             command=command,

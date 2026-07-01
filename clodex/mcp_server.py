@@ -4,6 +4,7 @@ import json
 import sys
 from typing import Any
 
+from .tasks import TaskManager
 from .workflow import ClodexWorkflow
 
 
@@ -44,6 +45,28 @@ TOOLS = [
         "description": "Update a local Clodex task status.",
         "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "status": {"type": "string"}}, "required": ["id", "status"]},
     },
+    {
+        "name": "clodex_task_start",
+        "title": "Start async Clodex task",
+        "description": "Start a durable Clodex build and return a task handle.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"task": {"type": "string"}, "workspace": {"type": "string"}, "approval_profile": {"type": "string"}, "dry_run": {"type": "boolean"}},
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "clodex_task_get",
+        "title": "Get async Clodex task",
+        "description": "Get a durable Clodex run by run id.",
+        "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]},
+    },
+    {
+        "name": "clodex_task_cancel",
+        "title": "Cancel async Clodex task",
+        "description": "Request cancellation of a durable Clodex run.",
+        "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]},
+    },
 ]
 
 
@@ -70,7 +93,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             "id": request_id,
             "result": {
                 "protocolVersion": "2025-11-25",
-                "capabilities": {"tools": {"listChanged": False}},
+                "capabilities": {"tools": {"listChanged": False}, "tasks": {}},
                 "serverInfo": {"name": "clodex-mcp-server", "version": "0.1.0"},
             },
         }
@@ -83,6 +106,28 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
         name = params.get("name")
         arguments = params.get("arguments") or {}
         return {"jsonrpc": "2.0", "id": request_id, "result": tool_call(name, arguments)}
+    if method == "tasks/get":
+        params = request.get("params") or {}
+        run_id = str(params.get("id") or params.get("taskId") or "")
+        data = TaskManager().get(run_id)
+        if data is None:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": f"Unknown task: {run_id}"}}
+        return {"jsonrpc": "2.0", "id": request_id, "result": task_result(data)}
+    if method == "tasks/cancel":
+        params = request.get("params") or {}
+        run_id = str(params.get("id") or params.get("taskId") or "")
+        try:
+            result = TaskManager().cancel(run_id)
+        except ValueError as exc:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": str(exc)}}
+        return {"jsonrpc": "2.0", "id": request_id, "result": task_result({"run": result.__dict__})}
+    if method == "tasks/update":
+        params = request.get("params") or {}
+        run_id = str(params.get("id") or params.get("taskId") or "")
+        data = TaskManager().get(run_id)
+        if data is None:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": f"Unknown task: {run_id}"}}
+        return {"jsonrpc": "2.0", "id": request_id, "result": task_result(data)}
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
 
@@ -103,9 +148,36 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     elif name == "clodex_task_update":
         workflow.state.update_task(str(arguments["id"]), str(arguments["status"]))
         return {"content": [{"type": "text", "text": "task updated"}], "isError": False}
+    elif name == "clodex_task_start":
+        result = TaskManager().start(
+            str(arguments["task"]),
+            workspace_backend=arguments.get("workspace"),
+            approval_profile=arguments.get("approval_profile"),
+            dry_run=bool(arguments.get("dry_run", False)),
+        )
+        return {"content": [{"type": "text", "text": json.dumps(task_result({"run": result.__dict__}), indent=2)}], "isError": False}
+    elif name == "clodex_task_get":
+        data = TaskManager().get(str(arguments["run_id"]))
+        if data is None:
+            return {"content": [{"type": "text", "text": f"Unknown run: {arguments['run_id']}"}], "isError": True}
+        return {"content": [{"type": "text", "text": json.dumps(data, indent=2)}], "isError": False}
+    elif name == "clodex_task_cancel":
+        result = TaskManager().cancel(str(arguments["run_id"]))
+        return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": False}
     else:
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
     return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": result.status == "blocked"}
+
+
+def task_result(data: dict[str, Any]) -> dict[str, Any]:
+    run = data.get("run") or {}
+    run_id = run.get("id") or run.get("run_id")
+    status = run.get("status", "unknown")
+    return {
+        "id": run_id,
+        "status": status,
+        "result": data,
+    }
 
 
 if __name__ == "__main__":
