@@ -210,7 +210,7 @@ def target_status(path: Path, desired: str) -> str:
         return "missing"
     try:
         current = _read_text_preserve_newlines(path)
-    except UnicodeDecodeError:
+    except (OSError, UnicodeDecodeError):
         return "invalid"
     return "current" if current == desired else "stale"
 
@@ -246,7 +246,18 @@ def plan_native_install(
                     "action": "error",
                     "status": "invalid",
                     "preview": "",
-                    "error": f"Invalid UTF-8: {exc}",
+                    "error": f"Invalid UTF-8 in {path}: {exc}",
+                }
+            )
+            continue
+        except OSError as exc:
+            files.append(
+                {
+                    "path": str(path),
+                    "action": "error",
+                    "status": "invalid",
+                    "preview": "",
+                    "error": f"Cannot read {path}: {exc}",
                 }
             )
             continue
@@ -337,7 +348,9 @@ def _preflight_native_writes(files: list[dict[str, Any]]) -> None:
 
 def _has_unmanaged_codex_mcp_table(existing: str) -> bool:
     in_managed_block = False
-    for line in existing.splitlines(keepends=True):
+    for line, outside_multiline_string in _toml_scanned_lines(existing):
+        if not outside_multiline_string:
+            continue
         stripped = line.strip()
         if stripped == TOML_BEGIN_MARKER:
             in_managed_block = True
@@ -349,12 +362,16 @@ def _has_unmanaged_codex_mcp_table(existing: str) -> bool:
 
 
 def _remove_unmanaged_codex_mcp_tables(existing: str) -> str:
-    lines = existing.splitlines(keepends=True)
+    lines = _toml_scanned_lines(existing)
     kept: list[str] = []
     index = 0
     in_managed_block = False
     while index < len(lines):
-        line = lines[index]
+        line, outside_multiline_string = lines[index]
+        if not outside_multiline_string:
+            kept.append(line)
+            index += 1
+            continue
         stripped = line.strip()
         if stripped == TOML_BEGIN_MARKER:
             in_managed_block = True
@@ -368,12 +385,77 @@ def _remove_unmanaged_codex_mcp_tables(existing: str) -> str:
             continue
         if not in_managed_block and _is_codex_mcp_table_header(line):
             index += 1
-            while index < len(lines) and not _is_toml_table_header(lines[index]):
+            while index < len(lines):
+                next_line, next_outside_multiline_string = lines[index]
+                if next_outside_multiline_string and _is_toml_table_header(next_line):
+                    break
                 index += 1
             continue
         kept.append(line)
         index += 1
     return "".join(kept)
+
+
+def _toml_scanned_lines(existing: str) -> list[tuple[str, bool]]:
+    scanned: list[tuple[str, bool]] = []
+    multiline_kind: str | None = None
+    for line in existing.splitlines(keepends=True):
+        scanned.append((line, multiline_kind is None))
+        multiline_kind = _update_toml_multiline_kind(line, multiline_kind)
+    return scanned
+
+
+def _update_toml_multiline_kind(line: str, multiline_kind: str | None) -> str | None:
+    index = 0
+    while index < len(line):
+        if multiline_kind == "basic":
+            end = line.find('"""', index)
+            if end == -1:
+                return multiline_kind
+            multiline_kind = None
+            index = end + 3
+            continue
+        if multiline_kind == "literal":
+            end = line.find("'''", index)
+            if end == -1:
+                return multiline_kind
+            multiline_kind = None
+            index = end + 3
+            continue
+        if line.startswith('"""', index):
+            multiline_kind = "basic"
+            index += 3
+            continue
+        if line.startswith("'''", index):
+            multiline_kind = "literal"
+            index += 3
+            continue
+        char = line[index]
+        if char == "#":
+            return multiline_kind
+        if char == '"':
+            index = _skip_toml_basic_string(line, index + 1)
+            continue
+        if char == "'":
+            end = line.find("'", index + 1)
+            index = len(line) if end == -1 else end + 1
+            continue
+        index += 1
+    return multiline_kind
+
+
+def _skip_toml_basic_string(line: str, index: int) -> int:
+    escaped = False
+    while index < len(line):
+        char = line[index]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            return index + 1
+        index += 1
+    return index
 
 
 def _is_codex_mcp_table_header(line: str) -> bool:

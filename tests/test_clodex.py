@@ -556,6 +556,18 @@ class ClodexTests(unittest.TestCase):
         self.assertEqual(item["action"], "error")
         self.assertIn("utf-8", item["error"].lower())
 
+    def test_native_plan_reports_directory_target_as_invalid(self):
+        from clodex.native import plan_native_install
+
+        with TempRepo() as repo:
+            (repo / "CLAUDE.md").mkdir()
+            plan = plan_native_install(repo, no_mcp_config=True)
+        item = next(item for item in plan["files"] if Path(item["path"]).name == "CLAUDE.md")
+        self.assertEqual(item["status"], "invalid")
+        self.assertEqual(item["action"], "error")
+        self.assertEqual(item["preview"], "")
+        self.assertIn("CLAUDE.md", item["error"])
+
     def test_native_plan_reports_invalid_unrelated_toml_config(self):
         from clodex.native import plan_native_install
 
@@ -586,6 +598,18 @@ class ClodexTests(unittest.TestCase):
                 apply_native_install(repo, no_mcp_config=True)
             self.assertFalse((repo / "AGENTS.md").exists())
             self.assertEqual((repo / "CLAUDE.md").read_bytes(), b"\xff\xfe\xff")
+            self.assertEqual((repo / "CLODEX.md").read_bytes(), clodex_before)
+
+    def test_apply_native_install_rejects_directory_target_without_partial_writes(self):
+        from clodex.native import apply_native_install
+
+        with TempRepo() as repo:
+            (repo / "CLAUDE.md").mkdir()
+            clodex_before = (repo / "CLODEX.md").read_bytes()
+            with self.assertRaisesRegex(ManagedBlockError, "CLAUDE.md"):
+                apply_native_install(repo, no_mcp_config=True)
+            self.assertTrue((repo / "CLAUDE.md").is_dir())
+            self.assertFalse((repo / "AGENTS.md").exists())
             self.assertEqual((repo / "CLODEX.md").read_bytes(), clodex_before)
 
     def test_apply_native_install_rejects_parent_file_conflict_without_partial_writes(self):
@@ -717,6 +741,36 @@ class ClodexTests(unittest.TestCase):
         existing = '["mcp_servers"."clo\\u0064ex"]\ncommand = "old"\n'
         with self.assertRaisesRegex(ManagedBlockError, "mcp_servers.clodex"):
             render_codex_toml(existing)
+
+    def test_render_codex_toml_ignores_table_text_inside_multiline_basic_string(self):
+        from clodex.native import render_codex_toml
+
+        existing = 'notes = """\n[mcp_servers.clodex]\ncommand = "text only"\n"""\n'
+        rendered = render_codex_toml(existing)
+        data = tomllib.loads(rendered)
+        self.assertEqual(data["notes"], '[mcp_servers.clodex]\ncommand = "text only"\n')
+        self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+        self.assertIn('[mcp_servers.clodex]\ncommand = "text only"\n', rendered)
+
+    def test_render_codex_toml_force_ignores_table_text_inside_multiline_basic_string(self):
+        from clodex.native import render_codex_toml
+
+        existing = 'notes = """\n[mcp_servers.clodex]\ncommand = "text only"\n"""\n'
+        rendered = render_codex_toml(existing, force=True)
+        data = tomllib.loads(rendered)
+        self.assertEqual(data["notes"], '[mcp_servers.clodex]\ncommand = "text only"\n')
+        self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+        self.assertIn('[mcp_servers.clodex]\ncommand = "text only"\n', rendered)
+
+    def test_render_codex_toml_ignores_table_text_inside_multiline_literal_string(self):
+        from clodex.native import render_codex_toml
+
+        existing = "notes = '''\n[mcp_servers.clodex]\ncommand = \"text only\"\n'''\n"
+        rendered = render_codex_toml(existing)
+        data = tomllib.loads(rendered)
+        self.assertEqual(data["notes"], '[mcp_servers.clodex]\ncommand = "text only"\n')
+        self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+        self.assertIn('[mcp_servers.clodex]\ncommand = "text only"\n', rendered)
 
     def test_render_codex_toml_force_adopts_unmanaged_clodex_table(self):
         from clodex.native import render_codex_toml
