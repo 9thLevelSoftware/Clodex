@@ -11,6 +11,7 @@ END_MARKER = "<!-- END CLODEX -->"
 TOML_BEGIN_MARKER = "# BEGIN CLODEX"
 TOML_END_MARKER = "# END CLODEX"
 DEFAULT_HANDOFF_BUDGET = 6
+CODEX_MCP_TABLE = "mcp_servers.clodex"
 
 
 class ManagedBlockError(ValueError):
@@ -151,6 +152,10 @@ args = ["mcp-server"]
 
 
 def render_codex_toml(existing: str, *, force: bool = False) -> str:
+    if _has_unmanaged_codex_mcp_table(existing):
+        if not force:
+            raise ManagedBlockError(f".codex/config.toml already contains unmanaged [{CODEX_MCP_TABLE}]")
+        existing = _remove_unmanaged_codex_mcp_tables(existing)
     return replace_toml_managed_block(existing, codex_mcp_block(), force=force)[0]
 
 
@@ -277,6 +282,66 @@ def apply_native_install(
 def _read_text_preserve_newlines(path: Path) -> str:
     with path.open("r", encoding="utf-8", newline="") as handle:
         return handle.read()
+
+
+def _has_unmanaged_codex_mcp_table(existing: str) -> bool:
+    in_managed_block = False
+    for line in existing.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == TOML_BEGIN_MARKER:
+            in_managed_block = True
+        elif stripped == TOML_END_MARKER:
+            in_managed_block = False
+        elif not in_managed_block and _is_codex_mcp_table_header(line):
+            return True
+    return False
+
+
+def _remove_unmanaged_codex_mcp_tables(existing: str) -> str:
+    lines = existing.splitlines(keepends=True)
+    kept: list[str] = []
+    index = 0
+    in_managed_block = False
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if stripped == TOML_BEGIN_MARKER:
+            in_managed_block = True
+            kept.append(line)
+            index += 1
+            continue
+        if stripped == TOML_END_MARKER:
+            in_managed_block = False
+            kept.append(line)
+            index += 1
+            continue
+        if not in_managed_block and _is_codex_mcp_table_header(line):
+            index += 1
+            while index < len(lines) and not _is_toml_table_header(lines[index]):
+                index += 1
+            continue
+        kept.append(line)
+        index += 1
+    return "".join(kept)
+
+
+def _is_codex_mcp_table_header(line: str) -> bool:
+    return _toml_table_name(line) == CODEX_MCP_TABLE
+
+
+def _is_toml_table_header(line: str) -> bool:
+    return _toml_table_name(line) is not None
+
+
+def _toml_table_name(line: str) -> str | None:
+    value = line.strip().split("#", 1)[0].strip()
+    if value.startswith("[[") and value.endswith("]]"):
+        name = value[2:-2].strip()
+    elif value.startswith("[") and value.endswith("]") and not value.startswith("[["):
+        name = value[1:-1].strip()
+    else:
+        return None
+    return name or None
 
 
 def _replace_managed_block(

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -568,6 +569,30 @@ class ClodexTests(unittest.TestCase):
         self.assertIn(b"[mcp_servers.clodex]\r\n", content)
         self.assertIn(b'args = ["mcp-server"]\r\n', content)
 
+    def test_apply_native_install_force_adopts_crlf_unmanaged_codex_config(self):
+        from clodex.native import apply_native_install
+
+        with TempRepo() as repo:
+            config = repo / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_bytes(
+                b'model = "gpt-5.5"\r\n'
+                b"\r\n"
+                b"[mcp_servers.clodex]\r\n"
+                b'command = "old-clodex"\r\n'
+                b'args = ["old"]\r\n'
+                b"\r\n"
+                b"[mcp_servers.other]\r\n"
+                b'command = "other"\r\n'
+            )
+            apply_native_install(repo, force=True)
+            content = config.read_bytes()
+        self.assertEqual(content.count(b"[mcp_servers.clodex]"), 1)
+        self.assertIn(b"# BEGIN CLODEX\r\n", content)
+        self.assertIn(b'command = "clodex"\r\n', content)
+        self.assertIn(b"[mcp_servers.other]\r\n", content)
+        self.assertIn(b'command = "other"\r\n', content)
+
     def test_render_mcp_json_preserves_existing_servers(self):
         from clodex.native import render_mcp_json
 
@@ -615,6 +640,33 @@ class ClodexTests(unittest.TestCase):
         self.assertIn("[mcp_servers.clodex]", rendered)
         self.assertIn('command = "clodex"', rendered)
         self.assertIn('args = ["mcp-server"]', rendered)
+
+    def test_render_codex_toml_rejects_unmanaged_clodex_table_without_force(self):
+        from clodex.native import render_codex_toml
+
+        existing = 'model = "gpt-5.5"\n\n[mcp_servers.clodex]\ncommand = "old-clodex"\n'
+        with self.assertRaisesRegex(ManagedBlockError, "mcp_servers.clodex"):
+            render_codex_toml(existing)
+
+    def test_render_codex_toml_force_adopts_unmanaged_clodex_table(self):
+        from clodex.native import render_codex_toml
+
+        existing = (
+            'model = "gpt-5.5"\n'
+            "\n"
+            "[mcp_servers.clodex]\n"
+            'command = "old-clodex"\n'
+            'args = ["old"]\n'
+            "\n"
+            "[mcp_servers.other]\n"
+            'command = "other"\n'
+        )
+        rendered = render_codex_toml(existing, force=True)
+        self.assertEqual(rendered.count("[mcp_servers.clodex]"), 1)
+        self.assertIn('model = "gpt-5.5"', rendered)
+        self.assertIn("[mcp_servers.other]", rendered)
+        self.assertIn('command = "other"', rendered)
+        self.assertEqual(tomllib.loads(rendered)["mcp_servers"]["clodex"]["command"], "clodex")
 
 
 if __name__ == "__main__":
