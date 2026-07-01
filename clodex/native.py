@@ -315,6 +315,7 @@ def plan_native_install(
                 "preview": content,
             }
         )
+    _mark_preflight_conflicts(files, files)
     return {
         "mode": "global" if global_mode else "repo",
         "dry_run": dry_run,
@@ -367,7 +368,6 @@ def native_status(
         force=force,
     )
     files = [_status_entry(item) for item in plan["files"]]
-    _mark_preflight_conflicts(files, plan["files"])
     ok = all(item["status"] == "current" and item["action"] == "unchanged" for item in files)
     return {
         "ok": ok,
@@ -425,6 +425,8 @@ def _mark_preflight_conflicts(status_files: list[dict[str, Any]], plan_files: li
                 item["action"] = "error"
                 item["status"] = "invalid"
                 item["error"] = message
+                if "preview" in item:
+                    item["preview"] = ""
 
 
 def _read_text_preserve_newlines(path: Path) -> str:

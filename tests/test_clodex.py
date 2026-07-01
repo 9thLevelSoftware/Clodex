@@ -280,6 +280,35 @@ class ClodexTests(unittest.TestCase):
             self.assertFalse((repo / "CLAUDE.md").exists())
             self.assertTrue(any(Path(item["path"]).name == "CLAUDE.md" for item in data["files"]))
 
+    def test_cli_init_dry_run_reports_blocked_codex_parent_without_partial_writes(self):
+        with TempRepo() as repo:
+            clodex_before = (repo / "CLODEX.md").read_bytes()
+            (repo / ".codex").write_text("not a directory\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-m", "clodex", "--json", "init", "--dry-run"],
+                cwd=repo,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads(result.stdout)
+            item = next(
+                item
+                for item in data["files"]
+                if Path(item["path"]).name == "config.toml" and Path(item["path"]).parent.name == ".codex"
+            )
+            self.assertEqual(item["action"], "error")
+            self.assertEqual(item["status"], "invalid")
+            self.assertIn(".codex", item["error"])
+            self.assertFalse((repo / "CLAUDE.md").exists())
+            self.assertFalse((repo / "AGENTS.md").exists())
+            self.assertFalse((repo / ".mcp.json").exists())
+            self.assertTrue((repo / ".codex").is_file())
+            self.assertEqual((repo / "CLODEX.md").read_bytes(), clodex_before)
+
     def test_cli_init_writes_native_files_and_preserves_user_content(self):
         with TempRepo() as repo:
             (repo / "CLAUDE.md").write_text("user header\n", encoding="utf-8")

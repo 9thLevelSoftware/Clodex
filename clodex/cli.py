@@ -121,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         return exit_code
     if args.command == "init":
         try:
+            exit_code = 0
             if args.dry_run:
                 data = plan_native_install(
                     Path.cwd(),
@@ -129,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
                     no_mcp_config=args.no_mcp_config,
                     force=args.force,
                 )
+                has_errors = any(item["action"] == "error" for item in data["files"])
+                exit_code = 1 if has_errors else 0
             else:
                 data = apply_native_install(
                     Path.cwd(),
@@ -140,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
             print_output({"ok": False, "error": str(exc)}, args.json)
             return 1
         print_output(data, args.json)
-        return 0
+        return exit_code
     if args.command == "native":
         if args.native_command == "status":
             data = native_status(
