@@ -38,7 +38,7 @@ def replace_managed_block(existing: str, body: str, *, force: bool = False) -> t
 
 
 def replace_toml_managed_block(existing: str, body: str, *, force: bool = False) -> tuple[str, bool]:
-    return _replace_managed_block(existing, body, TOML_BEGIN_MARKER, TOML_END_MARKER, force=force)
+    return _replace_toml_managed_block(existing, body, force=force)
 
 
 def build_claude_block() -> str:
@@ -178,11 +178,27 @@ def render_codex_toml(existing: str, *, force: bool = False) -> str:
             raise ManagedBlockError(f".codex/config.toml already contains unmanaged [{CODEX_MCP_TABLE}]")
         existing = _remove_unmanaged_codex_mcp_tables(existing)
     rendered = replace_toml_managed_block(existing, codex_mcp_block(), force=force)[0]
+    _validate_rendered_codex_toml(rendered)
+    return rendered
+
+
+def _validate_rendered_codex_toml(rendered: str) -> None:
     try:
-        tomllib.loads(rendered)
+        data = tomllib.loads(rendered)
     except tomllib.TOMLDecodeError as exc:
         raise ManagedBlockError(f"Rendered .codex/config.toml is invalid: {exc}") from exc
-    return rendered
+    if not _has_clodex_mcp_command(data):
+        raise ManagedBlockError(f"Rendered .codex/config.toml is missing [{CODEX_MCP_TABLE}] command")
+
+
+def _has_clodex_mcp_command(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return False
+    clodex = servers.get("clodex")
+    return isinstance(clodex, dict) and clodex.get("command") == "clodex"
 
 
 def build_clodex_policy_block() -> str:
@@ -587,6 +603,42 @@ def _replace_managed_block(
     end_after = _after_marker_line(existing, end + len(end_marker))
     updated = existing[:begin] + replacement + existing[end_after:]
     return updated, updated != existing
+
+
+def _replace_toml_managed_block(existing: str, body: str, *, force: bool) -> tuple[str, bool]:
+    newline = _detect_newline(existing)
+    block_body = _normalize_block_body(body, newline)
+    replacement = f"{TOML_BEGIN_MARKER}{newline}{block_body}{TOML_END_MARKER}{newline}"
+    begin_spans = _toml_marker_line_spans(existing, TOML_BEGIN_MARKER)
+    end_spans = _toml_marker_line_spans(existing, TOML_END_MARKER)
+
+    if not begin_spans and not end_spans:
+        updated = existing + _append_separator(existing, newline) + replacement
+        return updated, updated != existing
+
+    if len(begin_spans) != 1 or len(end_spans) != 1 or end_spans[0][0] < begin_spans[0][0]:
+        if not force:
+            raise ManagedBlockError(f"Malformed Clodex managed block for {TOML_BEGIN_MARKER!r}")
+        marker_positions = [start for start, _end in begin_spans + end_spans]
+        prefix = existing[: min(marker_positions)] if marker_positions else existing
+        updated = prefix + _prefix_separator(prefix, newline) + replacement
+        return updated, updated != existing
+
+    begin_start = begin_spans[0][0]
+    end_after = end_spans[0][1]
+    updated = existing[:begin_start] + replacement + existing[end_after:]
+    return updated, updated != existing
+
+
+def _toml_marker_line_spans(existing: str, marker: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    offset = 0
+    for line, outside_multiline_string in _toml_scanned_lines(existing):
+        line_end = offset + len(line)
+        if outside_multiline_string and line.strip() == marker:
+            spans.append((offset, line_end))
+        offset = line_end
+    return spans
 
 
 def _normalize_block_body(body: str, newline: str) -> str:

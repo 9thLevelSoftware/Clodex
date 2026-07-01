@@ -793,6 +793,58 @@ class ClodexTests(unittest.TestCase):
         self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
         self.assertIn('[mcp_servers.clodex]\ncommand = "text only"\n', rendered)
 
+    def test_render_codex_toml_preserves_multiline_basic_string_managed_markers(self):
+        from clodex.native import render_codex_toml
+
+        existing = 'notes = """\n# BEGIN CLODEX\nnot managed\n# END CLODEX\n"""\n'
+        rendered = render_codex_toml(existing)
+        data = tomllib.loads(rendered)
+        self.assertEqual(data["notes"], "# BEGIN CLODEX\nnot managed\n# END CLODEX\n")
+        self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+        self.assertEqual(rendered.count("# BEGIN CLODEX"), 2)
+
+    def test_render_codex_toml_force_preserves_multiline_basic_string_managed_markers(self):
+        from clodex.native import render_codex_toml
+
+        existing = 'notes = """\n# BEGIN CLODEX\nnot managed\n# END CLODEX\n"""\n'
+        rendered = render_codex_toml(existing, force=True)
+        data = tomllib.loads(rendered)
+        self.assertEqual(data["notes"], "# BEGIN CLODEX\nnot managed\n# END CLODEX\n")
+        self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+        self.assertEqual(rendered.count("# BEGIN CLODEX"), 2)
+
+    def test_render_codex_toml_preserves_multiline_literal_string_managed_markers(self):
+        from clodex.native import render_codex_toml
+
+        existing = "notes = '''\n# BEGIN CLODEX\nnot managed\n# END CLODEX\n'''\n"
+        rendered = render_codex_toml(existing)
+        data = tomllib.loads(rendered)
+        self.assertEqual(data["notes"], "# BEGIN CLODEX\nnot managed\n# END CLODEX\n")
+        self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+        self.assertEqual(rendered.count("# BEGIN CLODEX"), 2)
+
+    def test_render_codex_toml_force_preserves_one_sided_marker_inside_multiline_string(self):
+        from clodex.native import render_codex_toml
+
+        existing = 'model = "gpt-5.5"\nnotes = """\n# BEGIN CLODEX\nnot managed\n"""\n'
+        rendered = render_codex_toml(existing, force=True)
+        data = tomllib.loads(rendered)
+        self.assertEqual(data["model"], "gpt-5.5")
+        self.assertEqual(data["notes"], "# BEGIN CLODEX\nnot managed\n")
+        self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+
+    def test_render_codex_toml_real_malformed_managed_block_outside_string_rejects_and_force_repairs(self):
+        from clodex.native import render_codex_toml
+
+        existing = 'model = "gpt-5.5"\n# BEGIN CLODEX\nold = "value"\n'
+        with self.assertRaises(ManagedBlockError):
+            render_codex_toml(existing)
+        rendered = render_codex_toml(existing, force=True)
+        data = tomllib.loads(rendered)
+        self.assertEqual(data["model"], "gpt-5.5")
+        self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+        self.assertNotIn('old = "value"', rendered)
+
     def test_render_codex_toml_force_adopts_unmanaged_clodex_table(self):
         from clodex.native import render_codex_toml
 
