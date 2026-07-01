@@ -170,11 +170,19 @@ def render_codex_toml(existing: str, *, force: bool = False) -> str:
                     raise ManagedBlockError(f"Invalid .codex/config.toml after removing unmanaged [{CODEX_MCP_TABLE}]: {repaired_exc}") from repaired_exc
             existing = repaired
             has_unmanaged_clodex_table = False
+            _reject_unsupported_unmanaged_codex_mcp_config(existing)
+        else:
+            _reject_unsupported_unmanaged_codex_mcp_config(existing)
     if has_unmanaged_clodex_table:
         if not force:
             raise ManagedBlockError(f".codex/config.toml already contains unmanaged [{CODEX_MCP_TABLE}]")
         existing = _remove_unmanaged_codex_mcp_tables(existing)
-    return replace_toml_managed_block(existing, codex_mcp_block(), force=force)[0]
+    rendered = replace_toml_managed_block(existing, codex_mcp_block(), force=force)[0]
+    try:
+        tomllib.loads(rendered)
+    except tomllib.TOMLDecodeError as exc:
+        raise ManagedBlockError(f"Rendered .codex/config.toml is invalid: {exc}") from exc
+    return rendered
 
 
 def build_clodex_policy_block() -> str:
@@ -347,6 +355,11 @@ def _preflight_native_writes(files: list[dict[str, Any]]) -> None:
 
 
 def _has_unmanaged_codex_mcp_table(existing: str) -> bool:
+    return bool(_unmanaged_codex_mcp_table_paths(existing))
+
+
+def _unmanaged_codex_mcp_table_paths(existing: str) -> list[list[str]]:
+    paths: list[list[str]] = []
     in_managed_block = False
     for line, outside_multiline_string in _toml_scanned_lines(existing):
         if not outside_multiline_string:
@@ -356,9 +369,11 @@ def _has_unmanaged_codex_mcp_table(existing: str) -> bool:
             in_managed_block = True
         elif stripped == TOML_END_MARKER:
             in_managed_block = False
-        elif not in_managed_block and _is_codex_mcp_table_header(line):
-            return True
-    return False
+        elif not in_managed_block:
+            parts = _toml_table_parts(line)
+            if parts is not None and _is_codex_mcp_table_path(parts):
+                paths.append(parts)
+    return paths
 
 
 def _remove_unmanaged_codex_mcp_tables(existing: str) -> str:
@@ -387,13 +402,53 @@ def _remove_unmanaged_codex_mcp_tables(existing: str) -> str:
             index += 1
             while index < len(lines):
                 next_line, next_outside_multiline_string = lines[index]
-                if next_outside_multiline_string and _is_toml_table_header(next_line):
-                    break
+                if next_outside_multiline_string:
+                    next_parts = _toml_table_parts(next_line)
+                    if next_parts is not None:
+                        if _is_codex_mcp_table_path(next_parts):
+                            index += 1
+                            continue
+                        break
                 index += 1
             continue
         kept.append(line)
         index += 1
     return "".join(kept)
+
+
+def _remove_toml_managed_blocks(existing: str) -> str:
+    kept: list[str] = []
+    in_managed_block = False
+    for line, outside_multiline_string in _toml_scanned_lines(existing):
+        stripped = line.strip()
+        if outside_multiline_string and stripped == TOML_BEGIN_MARKER:
+            in_managed_block = True
+            continue
+        if outside_multiline_string and stripped == TOML_END_MARKER and in_managed_block:
+            in_managed_block = False
+            continue
+        if not in_managed_block:
+            kept.append(line)
+    return "".join(kept)
+
+
+def _reject_unsupported_unmanaged_codex_mcp_config(existing: str) -> None:
+    unmanaged_text = _remove_unmanaged_codex_mcp_tables(_remove_toml_managed_blocks(existing))
+    if not unmanaged_text.strip():
+        return
+    try:
+        data = tomllib.loads(unmanaged_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ManagedBlockError(f"Invalid .codex/config.toml after removing unmanaged [{CODEX_MCP_TABLE}]: {exc}") from exc
+    if _has_codex_mcp_server_semantics(data):
+        raise ManagedBlockError(f".codex/config.toml contains unsupported unmanaged [{CODEX_MCP_TABLE}] config")
+
+
+def _has_codex_mcp_server_semantics(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    servers = data.get("mcp_servers")
+    return isinstance(servers, dict) and "clodex" in servers
 
 
 def _toml_scanned_lines(existing: str) -> list[tuple[str, bool]]:
@@ -459,7 +514,12 @@ def _skip_toml_basic_string(line: str, index: int) -> int:
 
 
 def _is_codex_mcp_table_header(line: str) -> bool:
-    return _toml_table_parts(line) == ["mcp_servers", "clodex"]
+    parts = _toml_table_parts(line)
+    return parts is not None and _is_codex_mcp_table_path(parts)
+
+
+def _is_codex_mcp_table_path(parts: list[str]) -> bool:
+    return parts[:2] == ["mcp_servers", "clodex"]
 
 
 def _is_toml_table_header(line: str) -> bool:

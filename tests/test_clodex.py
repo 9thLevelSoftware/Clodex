@@ -742,6 +742,27 @@ class ClodexTests(unittest.TestCase):
         with self.assertRaisesRegex(ManagedBlockError, "mcp_servers.clodex"):
             render_codex_toml(existing)
 
+    def test_render_codex_toml_rejects_non_header_clodex_shapes_with_and_without_force(self):
+        from clodex.native import render_codex_toml
+
+        for existing in (
+            'mcp_servers.clodex.command = "old"\n',
+            '[mcp_servers]\nclodex = { command = "old" }\n',
+            'mcp_servers = { clodex = { command = "old" } }\n',
+        ):
+            with self.subTest(existing=existing):
+                with self.assertRaisesRegex(ManagedBlockError, "mcp_servers.clodex"):
+                    render_codex_toml(existing)
+                with self.assertRaisesRegex(ManagedBlockError, "mcp_servers.clodex"):
+                    render_codex_toml(existing, force=True)
+
+    def test_render_codex_toml_rejects_descendant_unmanaged_clodex_table_without_force(self):
+        from clodex.native import render_codex_toml
+
+        existing = '[mcp_servers.clodex.env]\nFOO = "old"\n'
+        with self.assertRaisesRegex(ManagedBlockError, "mcp_servers.clodex"):
+            render_codex_toml(existing)
+
     def test_render_codex_toml_ignores_table_text_inside_multiline_basic_string(self):
         from clodex.native import render_codex_toml
 
@@ -791,6 +812,35 @@ class ClodexTests(unittest.TestCase):
         self.assertIn("[mcp_servers.other]", rendered)
         self.assertIn('command = "other"', rendered)
         self.assertEqual(tomllib.loads(rendered)["mcp_servers"]["clodex"]["command"], "clodex")
+
+    def test_render_codex_toml_force_adopts_descendant_unmanaged_clodex_tables(self):
+        from clodex.native import render_codex_toml
+
+        existing = (
+            'model = "gpt-5.5"\n'
+            "\n"
+            "[mcp_servers.clodex]\n"
+            'command = "old-clodex"\n'
+            "\n"
+            "[mcp_servers.clodex.env]\n"
+            'FOO = "old"\n'
+            "\n"
+            "[mcp_servers.clodex.env.nested]\n"
+            'BAR = "old"\n'
+            "\n"
+            "[mcp_servers.other]\n"
+            'command = "other"\n'
+        )
+        rendered = render_codex_toml(existing, force=True)
+        data = tomllib.loads(rendered)
+        self.assertEqual(rendered.count("[mcp_servers.clodex]"), 1)
+        self.assertNotIn("[mcp_servers.clodex.env]", rendered)
+        self.assertNotIn("[mcp_servers.clodex.env.nested]", rendered)
+        self.assertIn('model = "gpt-5.5"', rendered)
+        self.assertIn("[mcp_servers.other]", rendered)
+        self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+        self.assertNotIn("env", data["mcp_servers"]["clodex"])
+        self.assertEqual(data["mcp_servers"]["other"]["command"], "other")
 
     def test_render_codex_toml_force_adopts_quoted_unmanaged_clodex_tables(self):
         from clodex.native import render_codex_toml
