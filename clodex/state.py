@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any
 
 
+TERMINAL_STATUSES = {"approved", "blocked", "failed", "cancelled", "applied"}
+
+
 def now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -196,7 +199,7 @@ class StateStore:
         error: str | None = None,
     ) -> None:
         timestamp = now_iso()
-        completed = timestamp if status in {"approved", "blocked", "failed", "cancelled", "applied"} else None
+        completed = timestamp if status in TERMINAL_STATUSES else None
         with self.session() as con:
             con.execute(
                 """
@@ -228,6 +231,9 @@ class StateStore:
         handoff_budget: int = 6,
         task_id: str | None = None,
     ) -> dict[str, Any]:
+        if handoff_budget < 0:
+            raise ValueError("handoff_budget must be non-negative")
+
         timestamp = now_iso()
         with self.session() as con:
             con.execute(
@@ -262,17 +268,21 @@ class StateStore:
         blocked_reason: str | None = None,
         diff_hash: str | None = None,
     ) -> dict[str, Any]:
-        timestamp = now_iso()
         with self.session() as con:
             row = con.execute("select * from runs where id=?", (run_id,)).fetchone()
             if row is None:
                 raise ValueError(f"unknown run: {run_id}")
 
             current = dict(row)
+            current_status = str(current["status"])
+            if current_status in TERMINAL_STATUSES:
+                raise ValueError(f"terminal run cannot be updated: {run_id} ({current_status})")
+
+            timestamp = now_iso()
             handoff_count = _int_or_default(current.get("handoff_count"), 0)
             handoff_budget = _int_or_default(current.get("handoff_budget"), 6)
             next_count = handoff_count + (1 if increment_handoff else 0)
-            next_status = status or str(current["status"])
+            next_status = status or current_status
             next_blocked_reason = blocked_reason if blocked_reason is not None else current.get("blocked_reason")
             completed = None
 
@@ -280,7 +290,7 @@ class StateStore:
                 next_status = "blocked"
                 next_blocked_reason = "handoff budget exhausted"
                 completed = timestamp
-            elif next_status in {"approved", "blocked", "failed", "cancelled", "applied"}:
+            elif next_status in TERMINAL_STATUSES:
                 completed = timestamp
 
             con.execute(

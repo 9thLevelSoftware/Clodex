@@ -4,6 +4,7 @@ import json
 import os
 import runpy
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -244,6 +245,50 @@ class ClodexTests(unittest.TestCase):
             self.assertEqual(run["handoff_budget"], 2)
             self.assertIsNone(run["blocked_reason"])
 
+    def test_state_migrations_backfill_existing_old_schema_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state.sqlite3"
+            con = sqlite3.connect(db)
+            try:
+                con.executescript(
+                    """
+                    create table schema_version (
+                        version integer not null
+                    );
+                    insert into schema_version(version) values (2);
+                    create table runs (
+                        id text primary key,
+                        task_id text,
+                        status text not null,
+                        prompt text not null,
+                        diff_hash text,
+                        created_at text not null,
+                        updated_at text not null
+                    );
+                    insert into runs(id, task_id, status, prompt, diff_hash, created_at, updated_at)
+                    values ('run-old', 'task-old', 'handoff', 'old task', null, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                    """
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            store = StateStore(db)
+            run = store.get_run("run-old")
+            self.assertEqual(run["handoff_count"], 0)
+            self.assertEqual(run["handoff_budget"], 6)
+            self.assertIsNone(run["owner"])
+            self.assertIsNone(run["phase"])
+            self.assertIsNone(run["last_actor"])
+            self.assertIsNone(run["blocked_reason"])
+
+    def test_create_handoff_rejects_negative_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            with self.assertRaises(ValueError):
+                store.create_handoff("run-native", "native task", handoff_budget=-1)
+            self.assertIsNone(store.get_run("run-native"))
+
     def test_handoff_update_increments_budget_and_blocks_when_exhausted(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(Path(tmp) / "state.sqlite3")
@@ -263,6 +308,35 @@ class ClodexTests(unittest.TestCase):
             self.assertEqual(result["status"], "blocked")
             self.assertEqual(result["handoff_count"], 1)
             self.assertEqual(result["blocked_reason"], "handoff budget exhausted")
+
+    def test_blocked_handoff_cannot_be_updated_back_to_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=0)
+            store.update_handoff("run-native", phase="implementation", actor="claude", increment_handoff=True)
+            with self.assertRaises(ValueError):
+                store.update_handoff("run-native", status="handoff", phase="audit", actor="codex", diff_hash="abc123")
+            run = store.get_run("run-native")
+            self.assertEqual(run["status"], "blocked")
+            self.assertEqual(run["phase"], "implementation")
+            self.assertEqual(run["handoff_count"], 1)
+            self.assertEqual(run["blocked_reason"], "handoff budget exhausted")
+            self.assertIsNone(run["diff_hash"])
+
+    def test_approved_handoff_cannot_be_updated_or_incremented(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=2)
+            approved = store.update_handoff("run-native", status="approved", phase="done", actor="claude", increment_handoff=True)
+            self.assertEqual(approved["status"], "approved")
+            self.assertEqual(approved["handoff_count"], 1)
+            with self.assertRaises(ValueError):
+                store.update_handoff("run-native", phase="audit", actor="codex", increment_handoff=True, diff_hash="abc123")
+            run = store.get_run("run-native")
+            self.assertEqual(run["status"], "approved")
+            self.assertEqual(run["phase"], "done")
+            self.assertEqual(run["handoff_count"], 1)
+            self.assertIsNone(run["diff_hash"])
 
     def test_handoff_get_includes_latest_events_and_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
