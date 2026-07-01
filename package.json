@@ -1,0 +1,50 @@
+{
+  "name": "clodex",
+  "version": "0.1.0",
+  "description": "Native Claude Code and Codex collaboration for local-first agent workflows",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/9thLevelSoftware/Clodex.git"
+  },
+  "homepage": "https://github.com/9thLevelSoftware/Clodex#readme",
+  "bugs": {
+    "url": "https://github.com/9thLevelSoftware/Clodex/issues"
+  }
+  "type": "commonjs",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "mcp",
+    "agent-harness",
+    "developer-tools",
+    "ai"
+  ],
+  "bin": {
+    "clodex": "npm/clodex.js",
+    "clodex-mcp-server": "npm/clodex-mcp-server.js"
+  },
+  "files": [
+    "clodex/*.py",
+    "npm/*.js",
+    "bin/clodex",
+    "mcp-bridge/bin/clodex-mcp-server",
+    "skills/clodex-workflow",
+    ".claude-plugin",
+    ".codex-plugin",
+    "dist",
+    "CLODEX.md",
+    "README.md",
+    "pyproject.toml"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "python -m unittest discover -s tests -v",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

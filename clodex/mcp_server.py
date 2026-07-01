@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
+import uuid
 from typing import Any
 
 from .tasks import TaskManager
@@ -67,7 +69,62 @@ TOOLS = [
         "description": "Request cancellation of a durable Clodex run.",
         "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]},
     },
+    {
+        "name": "clodex_handoff_create",
+        "title": "Create Clodex handoff",
+        "description": "Create a native Claude/Codex handoff run.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "task": {"type": "string"},
+                "owner": {"type": "string"},
+                "phase": {"type": "string"},
+                "handoff_budget": {"type": "integer"},
+            },
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "clodex_handoff_update",
+        "title": "Update Clodex handoff",
+        "description": "Record native handoff phase, actor, report, status, and budget usage.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "phase": {"type": "string"},
+                "actor": {"type": "string"},
+                "owner": {"type": "string"},
+                "increment_handoff": {"type": "boolean"},
+                "report": {"type": "object"},
+                "status": {"type": "string"},
+                "blocked_reason": {"type": "string"},
+                "diff_hash": {"type": "string"},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "clodex_handoff_get",
+        "title": "Get Clodex handoff",
+        "description": "Read native handoff state, events, artifacts, budget, and next actor.",
+        "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]},
+    },
+    {
+        "name": "clodex_handoff_decide",
+        "title": "Decide Clodex handoff",
+        "description": "Evaluate whether a native handoff is approved, needs fixes, or blocked.",
+        "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]},
+    },
 ]
+
+HANDOFF_TOOL_NAMES = {
+    "clodex_handoff_create",
+    "clodex_handoff_update",
+    "clodex_handoff_get",
+    "clodex_handoff_decide",
+}
 
 
 def main() -> int:
@@ -132,6 +189,9 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if name in HANDOFF_TOOL_NAMES and not isinstance(arguments, dict):
+        return call_text("Arguments must be an object", is_error=True)
+
     workflow = ClodexWorkflow()
     if name == "clodex_plan":
         result = workflow.plan(str(arguments["task"]), dry_run=bool(arguments.get("dry_run", False)))
@@ -164,9 +224,169 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     elif name == "clodex_task_cancel":
         result = TaskManager().cancel(str(arguments["run_id"]))
         return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": False}
+    elif name == "clodex_handoff_create":
+        try:
+            handoff_budget = handoff_budget_argument(arguments)
+            run = workflow.state.create_handoff(
+                str(arguments.get("run_id") or f"native-{uuid.uuid4().hex[:12]}"),
+                str(required_argument(arguments, "task")),
+                owner=str(arguments.get("owner") or "claude"),
+                phase=str(arguments.get("phase") or "planning"),
+                handoff_budget=handoff_budget,
+            )
+        except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+            return call_text(expected_handoff_error(exc), is_error=True)
+        return call_json(run)
+    elif name == "clodex_handoff_update":
+        try:
+            run = workflow.state.update_handoff(
+                str(required_argument(arguments, "run_id")),
+                phase=arguments.get("phase"),
+                actor=arguments.get("actor"),
+                owner=arguments.get("owner"),
+                increment_handoff=bool(arguments.get("increment_handoff", False)),
+                report=arguments.get("report") if isinstance(arguments.get("report"), dict) else None,
+                status=arguments.get("status"),
+                blocked_reason=arguments.get("blocked_reason"),
+                diff_hash=arguments.get("diff_hash"),
+            )
+        except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+            return call_text(expected_handoff_error(exc), is_error=True)
+        return call_json(run, is_error=run.get("status") == "blocked")
+    elif name == "clodex_handoff_get":
+        try:
+            run_id = str(required_argument(arguments, "run_id"))
+            data = workflow.state.get_handoff(run_id)
+        except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+            return call_text(expected_handoff_error(exc), is_error=True)
+        if data is None:
+            return call_text(f"Unknown run: {run_id}", is_error=True)
+        return call_json(data)
+    elif name == "clodex_handoff_decide":
+        try:
+            run_id = str(required_argument(arguments, "run_id"))
+            data = workflow.state.get_handoff(run_id)
+        except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+            return call_text(expected_handoff_error(exc), is_error=True)
+        if data is None:
+            return call_text(f"Unknown run: {run_id}", is_error=True)
+
+        run = data["run"]
+        status = run.get("status")
+        if status == "approved":
+            decision = {"decision": "approved", "run_id": run["id"], "diff_hash": run.get("diff_hash")}
+            is_error = False
+        elif status in {"blocked", "failed", "cancelled", "completed", "applied"}:
+            decision = {
+                "decision": "blocked",
+                "run_id": run["id"],
+                "status": status,
+                "blocked_reason": run.get("blocked_reason") or run.get("error"),
+            }
+            is_error = True
+        elif agreement := handoff_agreement(data):
+            try:
+                approved_run = workflow.state.approve_handoff(run["id"], agreement["diff_hash"], approved_by=agreement["approved_by"])
+            except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+                return call_text(expected_handoff_error(exc), is_error=True)
+            decision = {
+                "decision": "approved",
+                "run_id": approved_run["id"],
+                "diff_hash": approved_run.get("diff_hash"),
+                "approved_by": agreement["approved_by"],
+            }
+            is_error = False
+        else:
+            decision = {
+                "decision": "needs_fix",
+                "run_id": run["id"],
+                "phase": run.get("phase"),
+                "budget_remaining": data["budget_remaining"],
+                "next_expected_actor": data["next_expected_actor"],
+            }
+            is_error = False
+        workflow.state.add_event(run["id"], "handoff.decide", decision)
+        return call_json(decision, is_error=is_error)
     else:
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
     return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": result.status == "blocked"}
+
+
+def call_text(text: str, is_error: bool = False) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": text}], "isError": is_error}
+
+
+def call_json(data: Any, is_error: bool = False) -> dict[str, Any]:
+    return call_text(json.dumps(data, indent=2), is_error=is_error)
+
+
+def required_argument(arguments: dict[str, Any], key: str) -> Any:
+    if key not in arguments or arguments[key] is None:
+        raise KeyError(key)
+    return arguments[key]
+
+
+def handoff_budget_argument(arguments: dict[str, Any]) -> int:
+    if "handoff_budget" not in arguments or arguments["handoff_budget"] is None:
+        return 6
+    value = arguments["handoff_budget"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("handoff_budget must be an integer")
+    return value
+
+
+def handoff_agreement(data: dict[str, Any]) -> dict[str, Any] | None:
+    latest_hash: str | None = None
+    approvals: set[str] = set()
+    for event in data.get("events") or []:
+        if event.get("event") != "handoff.update":
+            continue
+        event_data = event.get("data")
+        if not isinstance(event_data, dict):
+            continue
+        report = event_data.get("report")
+        if not isinstance(report, dict):
+            report = {}
+        actor = normalized_actor(event_data.get("actor") or report.get("actor"))
+        diff_hash = normalized_diff_hash(event_data.get("diff_hash") or report.get("diff_hash"))
+        if diff_hash is None:
+            if latest_hash is not None and actor is not None and report.get("approved") is False:
+                approvals.discard(actor)
+            continue
+        if diff_hash != latest_hash:
+            latest_hash = diff_hash
+            approvals = set()
+        if actor is None:
+            continue
+        if report.get("approved") is True:
+            approvals.add(actor)
+        elif report.get("approved") is False:
+            approvals.discard(actor)
+
+    if latest_hash is not None and {"claude", "codex"}.issubset(approvals):
+        return {"diff_hash": latest_hash, "approved_by": sorted(approvals)}
+    return None
+
+
+def normalized_actor(value: Any) -> str | None:
+    if value is None:
+        return None
+    actor = str(value).strip().lower()
+    return actor if actor in {"claude", "codex"} else None
+
+
+def normalized_diff_hash(value: Any) -> str | None:
+    if value is None:
+        return None
+    diff_hash = str(value).strip()
+    return diff_hash or None
+
+
+def expected_handoff_error(exc: Exception) -> str:
+    if isinstance(exc, KeyError):
+        key = exc.args[0] if exc.args else "argument"
+        return f"Missing required argument: {key}"
+    return str(exc)
 
 
 def task_result(data: dict[str, Any]) -> dict[str, Any]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -7,8 +8,34 @@ from pathlib import Path
 from typing import Any
 
 
+TERMINAL_STATUSES = {"approved", "blocked", "failed", "cancelled", "applied", "completed"}
+HANDOFF_REASON_STATUSES = {"blocked", "failed"}
+HANDOFF_REJECTED_STATUSES = TERMINAL_STATUSES - HANDOFF_REASON_STATUSES
+
+
 def now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    return default if value is None else int(value)
+
+
+def _reason_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _report_reason(report: dict[str, Any] | None) -> str | None:
+    if not report:
+        return None
+    for key in ("reason", "blocked_reason"):
+        reason = _reason_text(report.get(key))
+        if reason is not None:
+            return reason
+    return None
 
 
 class StateStore:
@@ -118,6 +145,12 @@ class StateStore:
             "error": "text",
             "started_at": "text",
             "completed_at": "text",
+            "owner": "text",
+            "phase": "text",
+            "handoff_count": "integer not null default 0",
+            "handoff_budget": "integer not null default 6",
+            "last_actor": "text",
+            "blocked_reason": "text",
         }
         for name, kind in columns.items():
             if name not in existing:
@@ -184,7 +217,8 @@ class StateStore:
         pid: int | None = None,
         error: str | None = None,
     ) -> None:
-        completed = now_iso() if status in {"approved", "blocked", "failed", "cancelled", "applied"} else None
+        timestamp = now_iso()
+        completed = timestamp if status in TERMINAL_STATUSES else None
         with self.session() as con:
             con.execute(
                 """
@@ -199,13 +233,223 @@ class StateStore:
                     updated_at=?
                 where id=?
                 """,
-                (status, diff_hash, workspace_path, artifacts_dir, pid, error, completed, now_iso(), run_id),
+                (status, diff_hash, workspace_path, artifacts_dir, pid, error, completed, timestamp, run_id),
             )
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self.session() as con:
             row = con.execute("select * from runs where id=?", (run_id,)).fetchone()
             return dict(row) if row else None
+
+    def create_handoff(
+        self,
+        run_id: str,
+        prompt: str,
+        owner: str = "claude",
+        phase: str = "planning",
+        handoff_budget: int = 6,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        if handoff_budget < 0:
+            raise ValueError("handoff_budget must be non-negative")
+
+        timestamp = now_iso()
+        with self.session() as con:
+            con.execute(
+                """
+                insert into runs(
+                    id, task_id, status, prompt, owner, phase, handoff_count,
+                    handoff_budget, created_at, updated_at, started_at
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, task_id, "handoff", prompt, owner, phase, 0, handoff_budget, timestamp, timestamp, timestamp),
+            )
+            self._insert_event(
+                con,
+                run_id,
+                "handoff.create",
+                {"owner": owner, "phase": phase, "handoff_budget": handoff_budget, "task_id": task_id},
+                timestamp,
+            )
+            row = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+            return dict(row)
+
+    def update_handoff(
+        self,
+        run_id: str,
+        phase: str | None = None,
+        actor: str | None = None,
+        owner: str | None = None,
+        report: dict[str, Any] | None = None,
+        increment_handoff: bool = False,
+        status: str | None = None,
+        blocked_reason: str | None = None,
+        diff_hash: str | None = None,
+    ) -> dict[str, Any]:
+        requested_reason = _reason_text(blocked_reason) or _report_reason(report)
+        if status in HANDOFF_REJECTED_STATUSES:
+            raise ValueError(f"handoff status cannot be set via update_handoff: {status}")
+
+        with self.session() as con:
+            con.execute("begin immediate")
+            row = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"unknown run: {run_id}")
+
+            current = dict(row)
+            current_status = str(current["status"])
+            if current_status in TERMINAL_STATUSES:
+                raise ValueError(f"terminal run cannot be updated: {run_id} ({current_status})")
+
+            timestamp = now_iso()
+            handoff_count = _int_or_default(current.get("handoff_count"), 0)
+            handoff_budget = _int_or_default(current.get("handoff_budget"), 6)
+            next_count = handoff_count + (1 if increment_handoff else 0)
+            next_status = status or current_status
+            next_blocked_reason = requested_reason if requested_reason is not None else current.get("blocked_reason")
+            completed = None
+
+            if next_count > handoff_budget:
+                next_status = "blocked"
+                next_blocked_reason = "handoff budget exhausted"
+                completed = timestamp
+            elif next_status in HANDOFF_REASON_STATUSES:
+                if requested_reason is None:
+                    raise ValueError(f"handoff status requires a reason: {next_status}")
+                next_blocked_reason = requested_reason
+                completed = timestamp
+            elif next_status in TERMINAL_STATUSES:
+                completed = timestamp
+
+            con.execute(
+                """
+                update runs set
+                    status=?,
+                    owner=coalesce(?, owner),
+                    phase=coalesce(?, phase),
+                    handoff_count=?,
+                    last_actor=coalesce(?, last_actor),
+                    diff_hash=coalesce(?, diff_hash),
+                    blocked_reason=?,
+                    completed_at=coalesce(?, completed_at),
+                    updated_at=?
+                where id=?
+                """,
+                (
+                    next_status,
+                    owner,
+                    phase,
+                    next_count,
+                    actor,
+                    diff_hash,
+                    next_blocked_reason,
+                    completed,
+                    timestamp,
+                    run_id,
+                ),
+            )
+
+            updated = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+            updated_run = dict(updated)
+            updated_count = _int_or_default(updated_run.get("handoff_count"), 0)
+            updated_budget = _int_or_default(updated_run.get("handoff_budget"), 6)
+            event_data: dict[str, Any] = {
+                "actor": actor,
+                "owner": updated_run.get("owner"),
+                "phase": updated_run.get("phase"),
+                "status": updated_run.get("status"),
+                "handoff_count": updated_run.get("handoff_count"),
+                "handoff_budget": updated_run.get("handoff_budget"),
+                "budget_remaining": max(updated_budget - updated_count, 0),
+            }
+            if report is not None:
+                event_data["report"] = report
+            if diff_hash is not None:
+                event_data["diff_hash"] = diff_hash
+            if updated_run.get("blocked_reason"):
+                event_data["blocked_reason"] = updated_run["blocked_reason"]
+
+            event = "handoff.blocked" if updated_run.get("status") == "blocked" else "handoff.update"
+            self._insert_event(con, run_id, event, event_data, timestamp)
+            return updated_run
+
+    def approve_handoff(self, run_id: str, diff_hash: str, approved_by: list[str] | None = None) -> dict[str, Any]:
+        normalized_diff = _reason_text(diff_hash)
+        if normalized_diff is None:
+            raise ValueError("approved handoff requires a diff hash")
+
+        actors = sorted(set(approved_by or []))
+        timestamp = now_iso()
+        with self.session() as con:
+            con.execute("begin immediate")
+            row = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"unknown run: {run_id}")
+            current = dict(row)
+            current_status = str(current["status"])
+            if current_status in TERMINAL_STATUSES and current_status != "approved":
+                raise ValueError(f"terminal run cannot be approved: {run_id} ({current_status})")
+            if current_status == "approved":
+                return current
+
+            con.execute(
+                """
+                update runs set
+                    status=?,
+                    phase=?,
+                    diff_hash=?,
+                    completed_at=coalesce(completed_at, ?),
+                    updated_at=?
+                where id=?
+                """,
+                ("approved", "decision", normalized_diff, timestamp, timestamp, run_id),
+            )
+            self._insert_event(
+                con,
+                run_id,
+                "handoff.approved",
+                {"diff_hash": normalized_diff, "approved_by": actors},
+                timestamp,
+            )
+            updated = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+            return dict(updated)
+
+    def get_handoff(self, run_id: str) -> dict[str, Any] | None:
+        with self.session() as con:
+            row = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+            if row is None:
+                return None
+
+            run = dict(row)
+            event_rows = con.execute("select * from run_events where run_id=? order by id", (run_id,)).fetchall()
+            events = []
+            for event_row in event_rows:
+                event = dict(event_row)
+                data_json = event.pop("data_json", "")
+                try:
+                    event["data"] = json.loads(data_json) if data_json else {}
+                except (TypeError, json.JSONDecodeError):
+                    event["data"] = {"raw": data_json}
+                events.append(event)
+
+            artifacts = [dict(artifact) for artifact in con.execute("select * from artifacts where run_id=? order by id", (run_id,))]
+            handoff_count = _int_or_default(run.get("handoff_count"), 0)
+            handoff_budget = _int_or_default(run.get("handoff_budget"), 6)
+            last_actor = run.get("last_actor")
+            if last_actor == "claude":
+                next_expected_actor = "codex"
+            elif last_actor == "codex":
+                next_expected_actor = "claude"
+            else:
+                next_expected_actor = run.get("owner") or "claude"
+            return {
+                "run": run,
+                "events": events,
+                "artifacts": artifacts,
+                "budget_remaining": max(handoff_budget - handoff_count, 0),
+                "next_expected_actor": next_expected_actor,
+            }
 
     def add_audit(self, run_id: str, agent: str, approved: bool, diff_hash: str | None, verdict_json: str) -> None:
         with self.session() as con:
@@ -225,13 +469,14 @@ class StateStore:
             )
 
     def add_event(self, run_id: str, event: str, data: dict[str, Any]) -> None:
-        import json
-
         with self.session() as con:
-            con.execute(
-                "insert into run_events(run_id, event, data_json, created_at) values (?, ?, ?, ?)",
-                (run_id, event, json.dumps(data, sort_keys=True), now_iso()),
-            )
+            self._insert_event(con, run_id, event, data, now_iso())
+
+    def _insert_event(self, con: sqlite3.Connection, run_id: str, event: str, data: dict[str, Any], timestamp: str) -> None:
+        con.execute(
+            "insert into run_events(run_id, event, data_json, created_at) values (?, ?, ?, ?)",
+            (run_id, event, json.dumps(data, sort_keys=True), timestamp),
+        )
 
     def add_artifact(self, run_id: str, name: str, path: str, kind: str) -> None:
         with self.session() as con:
@@ -272,9 +517,10 @@ class StateStore:
             return bool(row and row["requested"])
 
     def complete_cancel(self, run_id: str) -> None:
+        timestamp = now_iso()
         with self.session() as con:
-            con.execute("update cancellations set completed_at=? where run_id=?", (now_iso(), run_id))
-            con.execute("update runs set status=?, completed_at=?, updated_at=? where id=?", ("cancelled", now_iso(), now_iso(), run_id))
+            con.execute("update cancellations set completed_at=? where run_id=?", (timestamp, run_id))
+            con.execute("update runs set status=?, completed_at=?, updated_at=? where id=?", ("cancelled", timestamp, timestamp, run_id))
 
     def list_tasks(self) -> list[dict[str, Any]]:
         with self.session() as con:

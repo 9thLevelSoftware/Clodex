@@ -10,6 +10,13 @@ from .doctor import run_doctor
 from .evals import run_local_evals
 from .hooks import hook_config, ingest_hook_event
 from .mcp_server import main as mcp_main
+from .native import (
+    ManagedBlockError,
+    apply_native_install,
+    native_doctor,
+    native_status,
+    plan_native_install,
+)
 from .tasks import TaskManager
 from .workflow import ClodexWorkflow
 
@@ -20,6 +27,23 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("doctor", help="Check local Clodex, Claude Code, Codex, and git readiness")
+
+    init = sub.add_parser("init", help="Install native Claude Code and Codex collaboration instructions")
+    init.add_argument("--global", action="store_true", dest="global_mode")
+    init.add_argument("--dry-run", action="store_true")
+    init.add_argument("--no-mcp-config", action="store_true")
+    init.add_argument("--force", action="store_true")
+
+    native = sub.add_parser("native", help="Inspect native Clodex setup")
+    native_sub = native.add_subparsers(dest="native_command", required=True)
+    native_status_cmd = native_sub.add_parser("status")
+    native_status_cmd.add_argument("--global", action="store_true", dest="global_mode")
+    native_status_cmd.add_argument("--no-mcp-config", action="store_true")
+    native_status_cmd.add_argument("--force", action="store_true")
+    native_doctor_cmd = native_sub.add_parser("doctor")
+    native_doctor_cmd.add_argument("--global", action="store_true", dest="global_mode")
+    native_doctor_cmd.add_argument("--no-mcp-config", action="store_true")
+    native_doctor_cmd.add_argument("--force", action="store_true")
 
     plan = sub.add_parser("plan", help="Run the Claude planning wave")
     plan.add_argument("task", nargs="+")
@@ -95,6 +119,50 @@ def main(argv: list[str] | None = None) -> int:
         exit_code, data = run_doctor()
         print_output(data, args.json)
         return exit_code
+    if args.command == "init":
+        try:
+            exit_code = 0
+            if args.dry_run:
+                data = plan_native_install(
+                    Path.cwd(),
+                    dry_run=True,
+                    global_mode=args.global_mode,
+                    no_mcp_config=args.no_mcp_config,
+                    force=args.force,
+                )
+                has_errors = any(item["action"] == "error" for item in data["files"])
+                exit_code = 1 if has_errors else 0
+            else:
+                data = apply_native_install(
+                    Path.cwd(),
+                    global_mode=args.global_mode,
+                    no_mcp_config=args.no_mcp_config,
+                    force=args.force,
+                )
+        except ManagedBlockError as exc:
+            print_output({"ok": False, "error": str(exc)}, args.json)
+            return 1
+        print_output(data, args.json)
+        return exit_code
+    if args.command == "native":
+        if args.native_command == "status":
+            data = native_status(
+                Path.cwd(),
+                global_mode=args.global_mode,
+                no_mcp_config=args.no_mcp_config,
+                force=args.force,
+            )
+            print_output(data, args.json)
+            return 0 if data["ok"] else 1
+        if args.native_command == "doctor":
+            exit_code, data = native_doctor(
+                Path.cwd(),
+                global_mode=args.global_mode,
+                no_mcp_config=args.no_mcp_config,
+                force=args.force,
+            )
+            print_output(data, args.json)
+            return exit_code
 
     workflow = ClodexWorkflow(Path.cwd())
 

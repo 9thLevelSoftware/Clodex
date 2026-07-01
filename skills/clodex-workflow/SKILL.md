@@ -5,7 +5,12 @@ description: Use when coordinating Claude Code CLI planning with Codex CLI imple
 
 # Clodex Workflow
 
-Use `clodex` for local-first dual-agent work:
+Prefer native Clodex coordination when the repository has been initialized with
+`clodex init`: use the available MCP handoff tools first, and use
+`clodex task ...`, `clodex audit --diff`, and `clodex status` as fallbacks. The
+older harness commands remain valid for scripted or non-MCP workflows.
+
+Harness commands:
 
 1. `clodex plan "<task>"` asks Claude Code CLI to produce a structured plan.
 2. `clodex build "<task>"` runs Claude planning, Codex implementation, and multi-reviewer audit in an isolated worktree.
