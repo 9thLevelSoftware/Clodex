@@ -116,6 +116,7 @@ def clodex_mcp_server_entry() -> dict[str, Any]:
 
 
 def render_mcp_json(existing: str, *, force: bool = False) -> str:
+    newline = _detect_newline(existing)
     text = existing.strip()
     if not text:
         data: dict[str, Any] = {}
@@ -141,7 +142,7 @@ def render_mcp_json(existing: str, *, force: bool = False) -> str:
             servers = {}
             data["mcpServers"] = servers
     servers["clodex"] = clodex_mcp_server_entry()
-    return json.dumps(data, indent=2, sort_keys=True) + "\n"
+    return (json.dumps(data, indent=2, sort_keys=True) + "\n").replace("\n", newline)
 
 
 def codex_mcp_block() -> str:
@@ -269,9 +270,13 @@ def apply_native_install(
         no_mcp_config=no_mcp_config,
         force=force,
     )
+    errors = [item for item in plan["files"] if item["action"] == "error"]
+    if errors:
+        paths = ", ".join(item["path"] for item in errors)
+        raise ManagedBlockError(f"Cannot apply native install while target files are invalid: {paths}")
     for item in plan["files"]:
         path = Path(item["path"])
-        if item["action"] in {"unchanged", "error"}:
+        if item["action"] == "unchanged":
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8", newline="") as handle:
@@ -326,22 +331,101 @@ def _remove_unmanaged_codex_mcp_tables(existing: str) -> str:
 
 
 def _is_codex_mcp_table_header(line: str) -> bool:
-    return _toml_table_name(line) == CODEX_MCP_TABLE
+    return _toml_table_parts(line) == ["mcp_servers", "clodex"]
 
 
 def _is_toml_table_header(line: str) -> bool:
-    return _toml_table_name(line) is not None
+    return _toml_table_parts(line) is not None
 
 
-def _toml_table_name(line: str) -> str | None:
-    value = line.strip().split("#", 1)[0].strip()
+def _toml_table_parts(line: str) -> list[str] | None:
+    value = _strip_toml_comment(line).strip()
     if value.startswith("[[") and value.endswith("]]"):
-        name = value[2:-2].strip()
+        inner = value[2:-2].strip()
     elif value.startswith("[") and value.endswith("]") and not value.startswith("[["):
-        name = value[1:-1].strip()
+        inner = value[1:-1].strip()
     else:
         return None
-    return name or None
+    return _parse_toml_key_parts(inner)
+
+
+def _strip_toml_comment(line: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(line):
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif quote == "'":
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "#":
+            return line[:index]
+    return line
+
+
+def _parse_toml_key_parts(value: str) -> list[str] | None:
+    parts: list[str] = []
+    index = 0
+    while True:
+        index = _skip_toml_key_space(value, index)
+        if index >= len(value):
+            return parts or None
+        if value[index] == '"':
+            part, index = _parse_basic_toml_key_part(value, index + 1)
+        elif value[index] == "'":
+            part, index = _parse_literal_toml_key_part(value, index + 1)
+        else:
+            start = index
+            while index < len(value) and value[index] not in ". \t":
+                index += 1
+            part = value[start:index]
+        if not part:
+            return None
+        parts.append(part)
+        index = _skip_toml_key_space(value, index)
+        if index >= len(value):
+            return parts
+        if value[index] != ".":
+            return None
+        index += 1
+
+
+def _parse_basic_toml_key_part(value: str, index: int) -> tuple[str, int]:
+    chars: list[str] = []
+    escaped = False
+    while index < len(value):
+        char = value[index]
+        if escaped:
+            chars.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            return "".join(chars), index + 1
+        else:
+            chars.append(char)
+        index += 1
+    return "", len(value)
+
+
+def _parse_literal_toml_key_part(value: str, index: int) -> tuple[str, int]:
+    end = value.find("'", index)
+    if end == -1:
+        return "", len(value)
+    return value[index:end], end + 1
+
+
+def _skip_toml_key_space(value: str, index: int) -> int:
+    while index < len(value) and value[index] in " \t":
+        index += 1
+    return index
 
 
 def _replace_managed_block(

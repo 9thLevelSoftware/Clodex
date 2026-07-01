@@ -556,6 +556,18 @@ class ClodexTests(unittest.TestCase):
         self.assertEqual(item["action"], "error")
         self.assertIn("utf-8", item["error"].lower())
 
+    def test_apply_native_install_rejects_invalid_target_without_partial_writes(self):
+        from clodex.native import apply_native_install
+
+        with TempRepo() as repo:
+            (repo / "CLAUDE.md").write_bytes(b"\xff\xfe\xff")
+            clodex_before = (repo / "CLODEX.md").read_bytes()
+            with self.assertRaisesRegex(ManagedBlockError, "CLAUDE.md"):
+                apply_native_install(repo, no_mcp_config=True)
+            self.assertFalse((repo / "AGENTS.md").exists())
+            self.assertEqual((repo / "CLAUDE.md").read_bytes(), b"\xff\xfe\xff")
+            self.assertEqual((repo / "CLODEX.md").read_bytes(), clodex_before)
+
     def test_apply_native_install_preserves_crlf_codex_config(self):
         from clodex.native import apply_native_install
 
@@ -632,6 +644,14 @@ class ClodexTests(unittest.TestCase):
         data = json.loads(render_mcp_json('{"mcpServers":[]}', force=True))
         self.assertEqual(data["mcpServers"]["clodex"]["command"], "clodex")
 
+    def test_render_mcp_json_preserves_crlf_style(self):
+        from clodex.native import render_mcp_json
+
+        rendered = render_mcp_json('{\r\n  "mcpServers": {}\r\n}\r\n')
+        self.assertIn("\r\n", rendered)
+        self.assertNotIn("\n", rendered.replace("\r\n", ""))
+        self.assertTrue(rendered.endswith("\r\n"))
+
     def test_render_codex_toml_preserves_existing_config(self):
         from clodex.native import render_codex_toml
 
@@ -647,6 +667,15 @@ class ClodexTests(unittest.TestCase):
         existing = 'model = "gpt-5.5"\n\n[mcp_servers.clodex]\ncommand = "old-clodex"\n'
         with self.assertRaisesRegex(ManagedBlockError, "mcp_servers.clodex"):
             render_codex_toml(existing)
+
+    def test_render_codex_toml_rejects_quoted_unmanaged_clodex_tables_without_force(self):
+        from clodex.native import render_codex_toml
+
+        for header in ('[mcp_servers."clodex"]', '["mcp_servers".clodex]', '["mcp_servers"."clodex"]'):
+            with self.subTest(header=header):
+                existing = f'model = "gpt-5.5"\n\n{header}\ncommand = "old-clodex"\n'
+                with self.assertRaisesRegex(ManagedBlockError, "mcp_servers.clodex"):
+                    render_codex_toml(existing)
 
     def test_render_codex_toml_force_adopts_unmanaged_clodex_table(self):
         from clodex.native import render_codex_toml
@@ -667,6 +696,31 @@ class ClodexTests(unittest.TestCase):
         self.assertIn("[mcp_servers.other]", rendered)
         self.assertIn('command = "other"', rendered)
         self.assertEqual(tomllib.loads(rendered)["mcp_servers"]["clodex"]["command"], "clodex")
+
+    def test_render_codex_toml_force_adopts_quoted_unmanaged_clodex_tables(self):
+        from clodex.native import render_codex_toml
+
+        for header in ('[mcp_servers."clodex"]', '["mcp_servers".clodex]', '["mcp_servers"."clodex"]'):
+            with self.subTest(header=header):
+                existing = (
+                    'model = "gpt-5.5"\r\n'
+                    "\r\n"
+                    f"{header}\r\n"
+                    'command = "old-clodex"\r\n'
+                    'args = ["old"]\r\n'
+                    "\r\n"
+                    "[mcp_servers.other]\r\n"
+                    'command = "other"\r\n'
+                )
+                rendered = render_codex_toml(existing, force=True)
+                data = tomllib.loads(rendered)
+                self.assertEqual(rendered.count("[mcp_servers.clodex]"), 1)
+                self.assertNotIn(header, rendered)
+                self.assertIn('model = "gpt-5.5"', rendered)
+                self.assertIn("[mcp_servers.other]", rendered)
+                self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+                self.assertEqual(data["mcp_servers"]["other"]["command"], "other")
+                self.assertIn("# BEGIN CLODEX\r\n", rendered)
 
 
 if __name__ == "__main__":
