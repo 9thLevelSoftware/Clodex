@@ -556,6 +556,26 @@ class ClodexTests(unittest.TestCase):
         self.assertEqual(item["action"], "error")
         self.assertIn("utf-8", item["error"].lower())
 
+    def test_native_plan_reports_invalid_unrelated_toml_config(self):
+        from clodex.native import plan_native_install
+
+        with TempRepo() as repo:
+            config = repo / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                "[mcp_servers.other]\n"
+                'command = "one"\n'
+                "\n"
+                "[mcp_servers.other]\n"
+                'command = "two"\n',
+                encoding="utf-8",
+            )
+            plan = plan_native_install(repo)
+        item = next(item for item in plan["files"] if item["path"].endswith(".codex\\config.toml") or item["path"].endswith(".codex/config.toml"))
+        self.assertEqual(item["status"], "invalid")
+        self.assertEqual(item["action"], "error")
+        self.assertIn("Invalid .codex/config.toml", item["error"])
+
     def test_apply_native_install_rejects_invalid_target_without_partial_writes(self):
         from clodex.native import apply_native_install
 
@@ -566,6 +586,20 @@ class ClodexTests(unittest.TestCase):
                 apply_native_install(repo, no_mcp_config=True)
             self.assertFalse((repo / "AGENTS.md").exists())
             self.assertEqual((repo / "CLAUDE.md").read_bytes(), b"\xff\xfe\xff")
+            self.assertEqual((repo / "CLODEX.md").read_bytes(), clodex_before)
+
+    def test_apply_native_install_rejects_parent_file_conflict_without_partial_writes(self):
+        from clodex.native import apply_native_install
+
+        with TempRepo() as repo:
+            clodex_before = (repo / "CLODEX.md").read_bytes()
+            (repo / ".codex").write_text("not a directory\n", encoding="utf-8")
+            with self.assertRaisesRegex(ManagedBlockError, ".codex"):
+                apply_native_install(repo)
+            self.assertFalse((repo / "CLAUDE.md").exists())
+            self.assertFalse((repo / "AGENTS.md").exists())
+            self.assertFalse((repo / ".mcp.json").exists())
+            self.assertTrue((repo / ".codex").is_file())
             self.assertEqual((repo / "CLODEX.md").read_bytes(), clodex_before)
 
     def test_apply_native_install_preserves_crlf_codex_config(self):
@@ -750,6 +784,32 @@ class ClodexTests(unittest.TestCase):
         self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
         self.assertEqual(data["mcp_servers"]["other"]["command"], "other")
         self.assertIn("# BEGIN CLODEX\r\n", rendered)
+
+    def test_render_codex_toml_rejects_invalid_unrelated_toml_without_force(self):
+        from clodex.native import render_codex_toml
+
+        existing = (
+            "[mcp_servers.other]\n"
+            'command = "one"\n'
+            "\n"
+            "[mcp_servers.other]\n"
+            'command = "two"\n'
+        )
+        with self.assertRaisesRegex(ManagedBlockError, "Invalid .codex/config.toml"):
+            render_codex_toml(existing)
+
+    def test_render_codex_toml_rejects_invalid_unrelated_toml_with_force(self):
+        from clodex.native import render_codex_toml
+
+        existing = (
+            "[mcp_servers.other]\n"
+            'command = "one"\n'
+            "\n"
+            "[mcp_servers.other]\n"
+            'command = "two"\n'
+        )
+        with self.assertRaisesRegex(ManagedBlockError, "Invalid .codex/config.toml"):
+            render_codex_toml(existing, force=True)
 
 
 if __name__ == "__main__":

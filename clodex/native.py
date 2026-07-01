@@ -155,7 +155,22 @@ args = ["mcp-server"]
 
 
 def render_codex_toml(existing: str, *, force: bool = False) -> str:
-    if _has_unmanaged_codex_mcp_table(existing):
+    has_unmanaged_clodex_table = _has_unmanaged_codex_mcp_table(existing)
+    if existing.strip():
+        try:
+            tomllib.loads(existing)
+        except tomllib.TOMLDecodeError as exc:
+            if not force or not has_unmanaged_clodex_table:
+                raise ManagedBlockError(f"Invalid .codex/config.toml: {exc}") from exc
+            repaired = _remove_unmanaged_codex_mcp_tables(existing)
+            if repaired.strip():
+                try:
+                    tomllib.loads(repaired)
+                except tomllib.TOMLDecodeError as repaired_exc:
+                    raise ManagedBlockError(f"Invalid .codex/config.toml after removing unmanaged [{CODEX_MCP_TABLE}]: {repaired_exc}") from repaired_exc
+            existing = repaired
+            has_unmanaged_clodex_table = False
+    if has_unmanaged_clodex_table:
         if not force:
             raise ManagedBlockError(f".codex/config.toml already contains unmanaged [{CODEX_MCP_TABLE}]")
         existing = _remove_unmanaged_codex_mcp_tables(existing)
@@ -235,6 +250,17 @@ def plan_native_install(
                 }
             )
             continue
+        except ManagedBlockError as exc:
+            files.append(
+                {
+                    "path": str(path),
+                    "action": "error",
+                    "status": "invalid",
+                    "preview": "",
+                    "error": str(exc),
+                }
+            )
+            continue
         status = target_status(path, content)
         if status == "missing":
             action = "create"
@@ -276,6 +302,7 @@ def apply_native_install(
     if errors:
         paths = ", ".join(item["path"] for item in errors)
         raise ManagedBlockError(f"Cannot apply native install while target files are invalid: {paths}")
+    _preflight_native_writes(plan["files"])
     for item in plan["files"]:
         path = Path(item["path"])
         if item["action"] == "unchanged":
@@ -289,6 +316,23 @@ def apply_native_install(
 def _read_text_preserve_newlines(path: Path) -> str:
     with path.open("r", encoding="utf-8", newline="") as handle:
         return handle.read()
+
+
+def _preflight_native_writes(files: list[dict[str, Any]]) -> None:
+    conflicts: list[str] = []
+    for item in files:
+        if item["action"] == "unchanged":
+            continue
+        path = Path(item["path"])
+        if path.exists() and path.is_dir():
+            conflicts.append(f"{path} is a directory")
+            continue
+        for ancestor in path.parents:
+            if ancestor.exists() and not ancestor.is_dir():
+                conflicts.append(f"{ancestor} is not a directory")
+                break
+    if conflicts:
+        raise ManagedBlockError("Cannot apply native install because target paths are blocked: " + "; ".join(conflicts))
 
 
 def _has_unmanaged_codex_mcp_table(existing: str) -> bool:
