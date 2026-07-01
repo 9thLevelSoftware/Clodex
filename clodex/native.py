@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ TOML_BEGIN_MARKER = "# BEGIN CLODEX"
 TOML_END_MARKER = "# END CLODEX"
 DEFAULT_HANDOFF_BUDGET = 6
 CODEX_MCP_TABLE = "mcp_servers.clodex"
+TOML_HEADER_PROBE_KEY = "__clodex_header_probe__"
 
 
 class ManagedBlockError(ValueError):
@@ -339,93 +341,33 @@ def _is_toml_table_header(line: str) -> bool:
 
 
 def _toml_table_parts(line: str) -> list[str] | None:
-    value = _strip_toml_comment(line).strip()
-    if value.startswith("[[") and value.endswith("]]"):
-        inner = value[2:-2].strip()
-    elif value.startswith("[") and value.endswith("]") and not value.startswith("[["):
-        inner = value[1:-1].strip()
-    else:
+    value = line.strip()
+    if not value.startswith("["):
         return None
-    return _parse_toml_key_parts(inner)
+    try:
+        parsed = tomllib.loads(f"{value}\n{TOML_HEADER_PROBE_KEY} = true\n")
+    except tomllib.TOMLDecodeError:
+        return None
+    return _find_toml_header_probe_path(parsed)
 
 
-def _strip_toml_comment(line: str) -> str:
-    quote: str | None = None
-    escaped = False
-    for index, char in enumerate(line):
-        if quote == '"':
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-        elif quote == "'":
-            if char == quote:
-                quote = None
-        elif char in {"'", '"'}:
-            quote = char
-        elif char == "#":
-            return line[:index]
-    return line
-
-
-def _parse_toml_key_parts(value: str) -> list[str] | None:
-    parts: list[str] = []
-    index = 0
-    while True:
-        index = _skip_toml_key_space(value, index)
-        if index >= len(value):
-            return parts or None
-        if value[index] == '"':
-            part, index = _parse_basic_toml_key_part(value, index + 1)
-        elif value[index] == "'":
-            part, index = _parse_literal_toml_key_part(value, index + 1)
-        else:
-            start = index
-            while index < len(value) and value[index] not in ". \t":
-                index += 1
-            part = value[start:index]
-        if not part:
-            return None
-        parts.append(part)
-        index = _skip_toml_key_space(value, index)
-        if index >= len(value):
-            return parts
-        if value[index] != ".":
-            return None
-        index += 1
-
-
-def _parse_basic_toml_key_part(value: str, index: int) -> tuple[str, int]:
-    chars: list[str] = []
-    escaped = False
-    while index < len(value):
-        char = value[index]
-        if escaped:
-            chars.append(char)
-            escaped = False
-        elif char == "\\":
-            escaped = True
-        elif char == '"':
-            return "".join(chars), index + 1
-        else:
-            chars.append(char)
-        index += 1
-    return "", len(value)
-
-
-def _parse_literal_toml_key_part(value: str, index: int) -> tuple[str, int]:
-    end = value.find("'", index)
-    if end == -1:
-        return "", len(value)
-    return value[index:end], end + 1
-
-
-def _skip_toml_key_space(value: str, index: int) -> int:
-    while index < len(value) and value[index] in " \t":
-        index += 1
-    return index
+def _find_toml_header_probe_path(value: Any, path: list[str] | None = None) -> list[str] | None:
+    current_path = [] if path is None else path
+    if isinstance(value, dict):
+        if value.get(TOML_HEADER_PROBE_KEY) is True:
+            return current_path
+        for key, child in value.items():
+            if key == TOML_HEADER_PROBE_KEY:
+                continue
+            found = _find_toml_header_probe_path(child, current_path + [str(key)])
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_toml_header_probe_path(child, current_path)
+            if found is not None:
+                return found
+    return None
 
 
 def _replace_managed_block(

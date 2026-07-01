@@ -677,6 +677,13 @@ class ClodexTests(unittest.TestCase):
                 with self.assertRaisesRegex(ManagedBlockError, "mcp_servers.clodex"):
                     render_codex_toml(existing)
 
+    def test_render_codex_toml_rejects_escaped_unmanaged_clodex_table_without_force(self):
+        from clodex.native import render_codex_toml
+
+        existing = '["mcp_servers"."clo\\u0064ex"]\ncommand = "old"\n'
+        with self.assertRaisesRegex(ManagedBlockError, "mcp_servers.clodex"):
+            render_codex_toml(existing)
+
     def test_render_codex_toml_force_adopts_unmanaged_clodex_table(self):
         from clodex.native import render_codex_toml
 
@@ -721,6 +728,28 @@ class ClodexTests(unittest.TestCase):
                 self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
                 self.assertEqual(data["mcp_servers"]["other"]["command"], "other")
                 self.assertIn("# BEGIN CLODEX\r\n", rendered)
+
+    def test_render_codex_toml_force_adopts_escaped_unmanaged_clodex_table(self):
+        from clodex.native import render_codex_toml
+
+        existing = (
+            'model = "gpt-5.5"\r\n'
+            "\r\n"
+            '["mcp_servers"."clo\\u0064ex"]\r\n'
+            'command = "old"\r\n'
+            "\r\n"
+            "[mcp_servers.other]\r\n"
+            'command = "other"\r\n'
+        )
+        rendered = render_codex_toml(existing, force=True)
+        data = tomllib.loads(rendered)
+        self.assertEqual(rendered.count("[mcp_servers.clodex]"), 1)
+        self.assertNotIn('["mcp_servers"."clo\\u0064ex"]', rendered)
+        self.assertIn('model = "gpt-5.5"', rendered)
+        self.assertIn("[mcp_servers.other]", rendered)
+        self.assertEqual(data["mcp_servers"]["clodex"]["command"], "clodex")
+        self.assertEqual(data["mcp_servers"]["other"]["command"], "other")
+        self.assertIn("# BEGIN CLODEX\r\n", rendered)
 
 
 if __name__ == "__main__":
