@@ -309,6 +309,68 @@ class ClodexTests(unittest.TestCase):
             self.assertEqual(result["handoff_count"], 1)
             self.assertEqual(result["blocked_reason"], "handoff budget exhausted")
 
+    def test_handoff_update_rejects_direct_approved_transition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=2)
+            with self.assertRaises(ValueError):
+                store.update_handoff("run-native", status="approved", phase="done", actor="claude", increment_handoff=True, diff_hash="abc123")
+            run = store.get_run("run-native")
+            self.assertEqual(run["status"], "handoff")
+            self.assertEqual(run["phase"], "planning")
+            self.assertEqual(run["handoff_count"], 0)
+            self.assertIsNone(run["last_actor"])
+            self.assertIsNone(run["diff_hash"])
+
+    def test_handoff_update_blocked_and_failed_require_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            for status in ("blocked", "failed"):
+                run_id = f"run-{status}"
+                with self.subTest(status=status):
+                    store.create_handoff(run_id, "native task", owner="claude", phase="planning", handoff_budget=2)
+                    with self.assertRaises(ValueError):
+                        store.update_handoff(run_id, status=status, phase="audit", actor="claude", diff_hash="abc123")
+                    run = store.get_run(run_id)
+                    self.assertEqual(run["status"], "handoff")
+                    self.assertEqual(run["phase"], "planning")
+                    self.assertEqual(run["handoff_count"], 0)
+                    self.assertIsNone(run["last_actor"])
+                    self.assertIsNone(run["blocked_reason"])
+                    self.assertIsNone(run["diff_hash"])
+
+    def test_handoff_update_blocked_with_reason_still_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=2)
+            result = store.update_handoff("run-native", status="blocked", phase="audit", actor="claude", blocked_reason="manual review")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["phase"], "audit")
+            self.assertEqual(result["last_actor"], "claude")
+            self.assertEqual(result["blocked_reason"], "manual review")
+            self.assertIsNotNone(result["completed_at"])
+
+    def test_handoff_update_failed_accepts_report_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=2)
+            result = store.update_handoff("run-native", status="failed", actor="claude", report={"reason": "tool crashed"})
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["blocked_reason"], "tool crashed")
+            self.assertIsNotNone(result["completed_at"])
+
+    def test_handoff_update_uses_latest_persisted_count_across_stores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state.sqlite3"
+            StateStore(db).create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=1)
+            first = StateStore(db).update_handoff("run-native", actor="claude", increment_handoff=True)
+            self.assertEqual(first["status"], "handoff")
+            self.assertEqual(first["handoff_count"], 1)
+            second = StateStore(db).update_handoff("run-native", actor="codex", increment_handoff=True)
+            self.assertEqual(second["status"], "blocked")
+            self.assertEqual(second["handoff_count"], 2)
+            self.assertEqual(second["blocked_reason"], "handoff budget exhausted")
+
     def test_blocked_handoff_cannot_be_updated_back_to_handoff(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(Path(tmp) / "state.sqlite3")
@@ -327,9 +389,10 @@ class ClodexTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(Path(tmp) / "state.sqlite3")
             store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=2)
-            approved = store.update_handoff("run-native", status="approved", phase="done", actor="claude", increment_handoff=True)
-            self.assertEqual(approved["status"], "approved")
-            self.assertEqual(approved["handoff_count"], 1)
+            active = store.update_handoff("run-native", phase="done", actor="claude", increment_handoff=True)
+            self.assertEqual(active["status"], "handoff")
+            self.assertEqual(active["handoff_count"], 1)
+            store.update_run("run-native", "approved")
             with self.assertRaises(ValueError):
                 store.update_handoff("run-native", phase="audit", actor="codex", increment_handoff=True, diff_hash="abc123")
             run = store.get_run("run-native")
@@ -361,6 +424,24 @@ class ClodexTests(unittest.TestCase):
             self.assertEqual(data["run"]["owner"], "codex")
             self.assertIsNone(data["run"]["last_actor"])
             self.assertEqual(data["next_expected_actor"], "codex")
+
+    def test_handoff_get_returns_raw_event_data_for_corrupt_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state.sqlite3"
+            store = StateStore(db)
+            store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=2)
+            con = sqlite3.connect(db)
+            try:
+                con.execute(
+                    "insert into run_events(run_id, event, data_json, created_at) values (?, ?, ?, ?)",
+                    ("run-native", "handoff.bad-json", "{not-json", "2026-01-01T00:00:00Z"),
+                )
+                con.commit()
+            finally:
+                con.close()
+            data = store.get_handoff("run-native")
+            event = next(event for event in data["events"] if event["event"] == "handoff.bad-json")
+            self.assertEqual(event["data"], {"raw": "{not-json"})
 
     def test_trace_writer_appends_jsonl_events(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 
-TERMINAL_STATUSES = {"approved", "blocked", "failed", "cancelled", "applied"}
+TERMINAL_STATUSES = {"approved", "blocked", "failed", "cancelled", "applied", "completed"}
+HANDOFF_REASON_STATUSES = {"blocked", "failed"}
+HANDOFF_REJECTED_STATUSES = TERMINAL_STATUSES - HANDOFF_REASON_STATUSES
 
 
 def now_iso() -> str:
@@ -17,6 +19,23 @@ def now_iso() -> str:
 
 def _int_or_default(value: Any, default: int) -> int:
     return default if value is None else int(value)
+
+
+def _reason_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _report_reason(report: dict[str, Any] | None) -> str | None:
+    if not report:
+        return None
+    for key in ("reason", "blocked_reason"):
+        reason = _reason_text(report.get(key))
+        if reason is not None:
+            return reason
+    return None
 
 
 class StateStore:
@@ -268,7 +287,12 @@ class StateStore:
         blocked_reason: str | None = None,
         diff_hash: str | None = None,
     ) -> dict[str, Any]:
+        requested_reason = _reason_text(blocked_reason) or _report_reason(report)
+        if status in HANDOFF_REJECTED_STATUSES:
+            raise ValueError(f"handoff status cannot be set via update_handoff: {status}")
+
         with self.session() as con:
+            con.execute("begin immediate")
             row = con.execute("select * from runs where id=?", (run_id,)).fetchone()
             if row is None:
                 raise ValueError(f"unknown run: {run_id}")
@@ -283,12 +307,17 @@ class StateStore:
             handoff_budget = _int_or_default(current.get("handoff_budget"), 6)
             next_count = handoff_count + (1 if increment_handoff else 0)
             next_status = status or current_status
-            next_blocked_reason = blocked_reason if blocked_reason is not None else current.get("blocked_reason")
+            next_blocked_reason = requested_reason if requested_reason is not None else current.get("blocked_reason")
             completed = None
 
             if next_count > handoff_budget:
                 next_status = "blocked"
                 next_blocked_reason = "handoff budget exhausted"
+                completed = timestamp
+            elif next_status in HANDOFF_REASON_STATUSES:
+                if requested_reason is None:
+                    raise ValueError(f"handoff status requires a reason: {next_status}")
+                next_blocked_reason = requested_reason
                 completed = timestamp
             elif next_status in TERMINAL_STATUSES:
                 completed = timestamp
