@@ -233,6 +233,40 @@ class ClodexTests(unittest.TestCase):
             self.assertIn("cancellations", tables)
             self.assertEqual(store.schema_version(), 2)
 
+    def test_state_migrations_add_native_handoff_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=2)
+            run = store.get_run("run-native")
+            self.assertEqual(run["owner"], "claude")
+            self.assertEqual(run["phase"], "planning")
+            self.assertEqual(run["handoff_count"], 0)
+            self.assertEqual(run["handoff_budget"], 2)
+            self.assertIsNone(run["blocked_reason"])
+
+    def test_handoff_update_increments_budget_and_blocks_when_exhausted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=1)
+            first = store.update_handoff("run-native", phase="implementation", actor="claude", increment_handoff=True)
+            self.assertEqual(first["status"], "handoff")
+            self.assertEqual(first["handoff_count"], 1)
+            second = store.update_handoff("run-native", phase="audit", actor="codex", increment_handoff=True)
+            self.assertEqual(second["status"], "blocked")
+            self.assertEqual(second["blocked_reason"], "handoff budget exhausted")
+
+    def test_handoff_get_includes_latest_events_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            store.create_handoff("run-native", "native task", owner="claude", phase="planning", handoff_budget=2)
+            store.add_artifact("run-native", "plan", "/tmp/plan.json", "json")
+            store.update_handoff("run-native", phase="implementation", actor="claude", report={"summary": "ready"})
+            data = store.get_handoff("run-native")
+            self.assertEqual(data["run"]["id"], "run-native")
+            self.assertEqual(data["run"]["phase"], "implementation")
+            self.assertEqual(data["artifacts"][0]["name"], "plan")
+            self.assertGreaterEqual(len(data["events"]), 1)
+
     def test_trace_writer_appends_jsonl_events(self):
         with tempfile.TemporaryDirectory() as tmp:
             trace = TraceWriter(Path(tmp), "run-1")
