@@ -16,6 +16,14 @@ from unittest import mock
 from clodex.commands import claude_plan_command, codex_exec_command, codex_review_command
 from clodex.config import load_config
 from clodex.jsonutil import extract_json_object
+from clodex.native import (
+    BEGIN_MARKER,
+    END_MARKER,
+    ManagedBlockError,
+    build_agents_block,
+    build_claude_block,
+    replace_managed_block,
+)
 from clodex.npm_bridge import main as npm_bridge_main
 from clodex.state import StateStore
 from clodex.trace import TraceWriter
@@ -440,6 +448,43 @@ class ClodexTests(unittest.TestCase):
         data = json.loads(result.stdout)
         self.assertEqual(data["status"], "dry-run")
         self.assertEqual(data["data"]["task"], "npm smoke")
+
+    def test_replace_managed_block_preserves_unmanaged_content(self):
+        existing = "header\n<!-- BEGIN CLODEX -->\nold\n<!-- END CLODEX -->\nfooter\n"
+        updated, changed = replace_managed_block(existing, "new\n")
+        self.assertTrue(changed)
+        self.assertEqual(updated, "header\n<!-- BEGIN CLODEX -->\nnew\n<!-- END CLODEX -->\nfooter\n")
+
+    def test_replace_managed_block_appends_when_missing(self):
+        updated, changed = replace_managed_block("header\n", "new\n")
+        self.assertTrue(changed)
+        self.assertEqual(updated, "header\n\n<!-- BEGIN CLODEX -->\nnew\n<!-- END CLODEX -->\n")
+
+    def test_replace_managed_block_is_idempotent(self):
+        existing = f"{BEGIN_MARKER}\nnew\n{END_MARKER}\n"
+        updated, changed = replace_managed_block(existing, "new\n")
+        self.assertFalse(changed)
+        self.assertEqual(updated, existing)
+
+    def test_replace_managed_block_rejects_malformed_block_without_force(self):
+        with self.assertRaises(ManagedBlockError):
+            replace_managed_block("header\n<!-- BEGIN CLODEX -->\nmissing end\n", "new\n")
+
+    def test_replace_managed_block_force_replaces_malformed_tail(self):
+        updated, changed = replace_managed_block("header\n<!-- BEGIN CLODEX -->\nmissing end\n", "new\n", force=True)
+        self.assertTrue(changed)
+        self.assertEqual(updated, "header\n<!-- BEGIN CLODEX -->\nnew\n<!-- END CLODEX -->\n")
+
+    def test_native_instruction_templates_include_mcp_and_cli_fallbacks(self):
+        claude = build_claude_block()
+        agents = build_agents_block()
+        self.assertIn("clodex_handoff_create", claude)
+        self.assertIn("clodex_handoff_decide", claude)
+        self.assertIn("clodex task start", claude)
+        self.assertIn("Codex is the default engineer", claude)
+        self.assertIn("clodex_handoff_update", agents)
+        self.assertIn("Claude Code is the default strategist", agents)
+        self.assertIn("handoff budget", agents)
 
 
 if __name__ == "__main__":
