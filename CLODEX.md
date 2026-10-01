@@ -23,7 +23,6 @@ codex:
   approval_profile: ci
 audit:
   quorum: unanimous
-  personas: [security, performance, portability, test-gap]
   reviewers: [{"id": "claude-plan", "backend": "claude", "persona": "plan-adherence", "required": true, "timeout": 600}, {"id": "codex-architecture", "backend": "codex", "persona": "architecture", "required": true, "timeout": 600}, {"id": "security", "backend": "codex", "persona": "security", "required": false, "timeout": 600}, {"id": "performance", "backend": "codex", "persona": "performance", "required": false, "timeout": 600}, {"id": "portability", "backend": "codex", "persona": "portability", "required": false, "timeout": 600}, {"id": "test-gap", "backend": "claude", "persona": "test-gap", "required": false, "timeout": 600}]
 mcp:
   async_tasks: true

@@ -391,6 +391,8 @@ def print_output(data: dict[str, Any], as_json: bool) -> None:
         print(json.dumps(data, indent=2, sort_keys=True))
     elif "diagnostics" in data and "python" in data:
         print("\n".join(format_doctor(data)))
+    elif "scenarios" in data and "passed" in data:
+        print("\n".join(format_evals(data)))
     else:
         print("\n".join(format_human(data)) or "(nothing to show)")
 
@@ -425,6 +427,12 @@ def format_human(data: Any, indent: int = 0) -> list[str]:
     else:
         lines.append(f"{pad}{_scalar(data)}")
     return lines
+
+
+def format_evals(data: dict[str, Any]) -> list[str]:
+    lines = [f"{'[ok]  ' if item['passed'] else '[FAIL]'} {item['name']}: {item['detail']}" for item in data["scenarios"]]
+    failed = sum(1 for item in data["scenarios"] if not item["passed"])
+    return [*lines, "", "All checks passed." if data["passed"] else f"{failed} check(s) failed."]
 
 
 def format_doctor(data: dict[str, Any]) -> list[str]:

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .config import resolve_repo_root
+from .config import load_config, resolve_repo_root
 from .delegate import DelegationManager, WaitAborted
 from .quorum import evaluate_handoff, resolve_reviewer
 from .schemas import validate as validate_schema
@@ -324,6 +324,7 @@ class McpServer:
         self.out = out or sys.stdout
         self.workers = workers
         self.version = LATEST_PROTOCOL_VERSION
+        self.async_tasks = True  # mcp.async_tasks in CLODEX.md; read when the client initializes
         self._write_lock = threading.Lock()
         self._closing = threading.Event()
         self._inflight: dict[Any, threading.Event] = {}
@@ -421,7 +422,7 @@ class McpServer:
 
     @property
     def tasks_enabled(self) -> bool:
-        return self.version >= TASKS_MIN_VERSION
+        return self.version >= TASKS_MIN_VERSION and self.async_tasks
 
     def handle(self, method: str, params: Any, cancelled: threading.Event) -> dict[str, Any]:
         if params is not None and not isinstance(params, dict):
@@ -452,6 +453,7 @@ class McpServer:
             raise RpcError(INVALID_PARAMS, "initialize requires a protocolVersion")
         # Echo the client's version if we speak it, else answer with our newest.
         self.version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else LATEST_PROTOCOL_VERSION
+        self.async_tasks = async_tasks_enabled(resolve_repo_root())
         capabilities: dict[str, Any] = {"tools": {"listChanged": False}}
         if self.tasks_enabled:
             capabilities["tasks"] = {"list": {}, "cancel": {}, "requests": {"tools": {"call": {}}}}
@@ -585,6 +587,8 @@ def tool_call(name: str, arguments: dict[str, Any], should_stop: Callable[[], bo
         workflow.state.update_task(str(arguments["id"]), str(arguments["status"]))
         return {"content": [{"type": "text", "text": "task updated"}], "isError": False}
     elif name == "clodex_task_start":
+        if not async_tasks_enabled(root):
+            return call_text("async tasks are disabled (mcp.async_tasks is false in CLODEX.md)", is_error=True)
         result = TaskManager(root).start(
             str(arguments["task"]),
             workspace_backend=arguments.get("workspace"),
@@ -767,6 +771,14 @@ def tool_call(name: str, arguments: dict[str, Any], should_stop: Callable[[], bo
     else:
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
     return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": result.status == "blocked"}
+
+
+def async_tasks_enabled(root: Path) -> bool:
+    """`mcp.async_tasks` in CLODEX.md (default on). A broken config must not take the server down."""
+    try:
+        return bool(load_config(root).mcp.get("async_tasks", True))
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def brief_handoff(state: Any, run_id: str) -> dict[str, Any]:

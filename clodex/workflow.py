@@ -269,7 +269,7 @@ class ClodexWorkflow:
             self._include_untracked(workspace.path)
             patch = artifacts.write_text("apply.patch", current_diff(workspace.path), exact=True)
             result.data["apply_patch"] = str(patch)
-            if apply_changes:
+            if apply_changes or str(self.config.workspace.get("apply_mode", "manual")) == "auto":
                 return self.apply_run(run_id)
         return result
 
