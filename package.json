@@ -26,6 +26,7 @@
   },
   "files": [
     "clodex/**/*.py",
+    "clodex/schemas/*.json",
     "clodex/_vendor/VENDORED.md",
     "clodex/_vendor/yaml/LICENSE",
     "npm/*.js",

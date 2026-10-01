@@ -1,0 +1,15 @@
+{
+  "title": "Clodex plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["goal", "scope", "out_of_scope", "implementation_spec", "acceptance_criteria", "risks", "test_commands"],
+  "properties": {
+    "goal": {"type": "string"},
+    "scope": {"type": "array", "items": {"type": "string"}},
+    "out_of_scope": {"type": "array", "items": {"type": "string"}},
+    "implementation_spec": {"type": "array", "items": {"type": "string"}},
+    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+    "risks": {"type": "array", "items": {"type": "string"}},
+    "test_commands": {"type": "array", "items": {"type": "string"}}
+  }
+}

@@ -62,10 +62,14 @@ class FakeCliPath:
         sleep_seconds: float = 0,
         include_clodex: bool = False,
         envelope_error_once: bool = False,
+        no_structured_output: bool = False,
+        schema_violation_once: bool = False,
     ):
         self.reject_once = reject_once
         self.malformed_once = malformed_once
         self.envelope_error_once = envelope_error_once
+        self.no_structured_output = no_structured_output
+        self.schema_violation_once = schema_violation_once
         self.sleep_seconds = sleep_seconds
         self.include_clodex = include_clodex
 
@@ -166,11 +170,27 @@ if name == 'claude':
     if flags.get('--permission-mode', ['plan'])[-1] not in ('acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'):
         fail('error: invalid --permission-mode')
     as_json = flags.get('--output-format', ['text'])[-1] == 'json'
+    schema_arg = flags.get('--json-schema', [None])[-1]
+    if schema_arg is not None:
+        # The real flag takes inline JSON only (not a path) and its validator
+        # does not know the draft 2020-12 `$schema` URI.
+        try:
+            schema_doc = json.loads(schema_arg)
+        except ValueError:
+            fail('Error: --json-schema is not valid JSON')
+        if '$schema' in schema_doc:
+            fail('Error: --json-schema is not a valid JSON Schema: no schema with key or ref ' + repr(schema_doc['$schema']))
 
     def emit(text, is_error=False):
         if as_json:
             # The real `claude -p --output-format json` wraps the answer in an envelope.
-            print(json.dumps({{'type': 'result', 'subtype': 'success', 'is_error': is_error, 'result': text, 'total_cost_usd': 0, 'session_id': 'fake'}}))
+            envelope = {{'type': 'result', 'subtype': 'success', 'is_error': is_error, 'result': text, 'total_cost_usd': 0, 'session_id': 'fake'}}
+            if schema_arg is not None and not is_error and {str(self.no_structured_output)!r} != 'True':
+                try:
+                    envelope['structured_output'] = json.loads(text)
+                except ValueError:
+                    pass
+            print(json.dumps(envelope))
         else:
             print(text)
         raise SystemExit(0)
@@ -183,6 +203,10 @@ if name == 'claude':
     if {str(self.malformed_once)!r} == 'True' and not marker.exists():
         marker.write_text('seen')
         emit('not json')
+    violation_marker = Path('.fake-claude-schema-violation')
+    if {str(self.schema_violation_once)!r} == 'True' and 'adversarial auditor' not in stdin and not violation_marker.exists():
+        violation_marker.write_text('seen')
+        emit(json.dumps({{'goal': 'only a goal'}}))
     if 'adversarial auditor' in stdin:
         reject_marker = Path('.fake-claude-reject')
         if {str(self.reject_once)!r} == 'True' and not reject_marker.exists():
@@ -210,6 +234,11 @@ if name == 'codex':
                 fail('error: invalid approval_policy ' + value)
         elif key != 'model':
             fail('error: unknown config key ' + key)
+    if '--output-schema' in flags:
+        schema_file = Path(flags['--output-schema'][-1])
+        if not schema_file.is_file():
+            fail('error: --output-schema file not found: ' + str(schema_file))
+        json.loads(schema_file.read_text(encoding='utf-8'))
     sandbox = (flags.get('-s') or flags.get('--sandbox') or ['read-only'])[-1]
     if sandbox not in ('read-only', 'workspace-write', 'danger-full-access'):
         fail('error: invalid sandbox ' + sandbox)

@@ -12,6 +12,7 @@ from clodex import config as config_module
 from clodex.agents import AgentRunner
 from clodex.commands import (
     AgentCommand,
+    claude_audit_command,
     claude_plan_command,
     codex_exec_command,
     codex_review_command,
@@ -24,8 +25,10 @@ class ConfigCommandTests(unittest.TestCase):
     def test_config_and_commands_use_requested_defaults(self):
         with TempRepo() as repo:
             config = load_config(repo)
-            self.assertEqual(config.claude["model"], "opus")
-            self.assertEqual(config.claude["effort"], "max")
+            self.assertEqual(config.claude_role("plan")["model"], "opus")
+            self.assertEqual(config.claude_role("plan")["effort"], "max")
+            self.assertEqual(config.claude_role("audit")["model"], "opus")
+            self.assertEqual(config.claude_role("audit")["effort"], "high")
             self.assertEqual(config.codex["model"], "gpt-6.1-sol")
             self.assertEqual(config.codex["reasoning_effort"], "xhigh")
             self.assertEqual(config.workspace["backend"], "git-worktree")
@@ -34,7 +37,11 @@ class ConfigCommandTests(unittest.TestCase):
             self.assertTrue(config.mcp["async_tasks"])
             self.assertTrue(config.tracing["enabled"])
             self.assertGreaterEqual(len(config.reviewers), 2)
-            self.assertIn("--permission-mode", claude_plan_command(config).argv)
+            plan_argv = claude_plan_command(config).argv
+            audit_argv_claude = claude_audit_command(config).argv
+            self.assertEqual(plan_argv[plan_argv.index("--effort") + 1], "max")
+            self.assertEqual(audit_argv_claude[audit_argv_claude.index("--effort") + 1], "high")
+            self.assertEqual(audit_argv_claude[audit_argv_claude.index("--permission-mode") + 1], "plan")
             self.assertIn("model_reasoning_effort=\"xhigh\"", codex_exec_command(config, repo).argv)
             audit_argv = codex_review_command(config, repo).argv
             self.assertEqual(audit_argv[:2], ["codex", "exec"])
@@ -97,8 +104,8 @@ class ConfigCommandTests(unittest.TestCase):
             )
             config = load_config(repo)
             self.assertEqual(config.claude["plan"], {"model": "fable", "effort": "max"})
-            self.assertEqual(config.claude["audit"]["effort"], "high")
-            self.assertEqual(config.claude["model"], "opus")
+            self.assertEqual(config.claude_role("plan")["model"], "fable")
+            self.assertEqual(config.claude_role("audit")["effort"], "high")
             self.assertEqual(config.codex["reasoning_effort"], "high")
             self.assertEqual(config.codex["model"], "gpt-6.1-sol")
             self.assertTrue(config.mcp["async_tasks"])

@@ -12,6 +12,7 @@ from .commands import claude_audit_command, claude_plan_command, codex_exec_comm
 from .config import ClodexConfig, load_config
 from .jsonutil import AgentEnvelopeError, extract_json_object
 from .prompts import audit_prompt, fix_prompt, implementation_prompt, plan_prompt
+from .schemas import SchemaValidationError, check as check_schema
 from .state import StateStore
 from .trace import TraceWriter
 from .workspace import DirtyWorkspaceError, WorkspaceManager, WorkspaceRef
@@ -320,11 +321,21 @@ class ClodexWorkflow:
             if not result.ok:
                 raise RuntimeError(f"{label} failed with exit code {result.returncode}: {result.stderr.strip()}")
             try:
-                return extract_json_object(result.stdout)
+                data = extract_json_object(result.output)
+                if command.schema_name:
+                    check_schema(data, command.schema_name)
+                return data
             except AgentEnvelopeError as exc:
                 last_error = str(exc)
                 if _attempt == 1:
                     raise RuntimeError(f"{label} returned an error: {last_error}") from exc
+            except SchemaValidationError as exc:
+                last_error = str(exc)
+                current_prompt = (
+                    prompt
+                    + "\n\nYour previous response did not match the required JSON schema. "
+                    + f"Return only a corrected JSON object. Problems: {last_error}"
+                )
             except ValueError as exc:
                 last_error = str(exc)
                 current_prompt = (

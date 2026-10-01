@@ -22,3 +22,6 @@ version = {attr = "clodex.__version__"}
 include = ["clodex*"]
 # pip installs depend on the real PyYAML; the vendored copy is for npm installs only.
 exclude = ["clodex._vendor*"]
+
+[tool.setuptools.package-data]
+clodex = ["schemas/*.json"]

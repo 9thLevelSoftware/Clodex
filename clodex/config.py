@@ -24,9 +24,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "apply_mode": "manual",
     },
     "claude": {
-        "model": "opus",
-        "effort": "max",
         "permission_mode": "plan",
+        # Planning gets the most reasoning; audits run often, so they default lower.
+        "plan": {"model": "opus", "effort": "max"},
+        "audit": {"model": "opus", "effort": "high"},
     },
     "codex": {
         "model": "gpt-6.1-sol",
@@ -53,6 +54,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
     },
 }
+
+
+ROLES = ("plan", "audit")
 
 
 class ConfigError(ValueError):
@@ -86,6 +90,9 @@ class ClodexConfig:
     repo_root: Path
     raw: dict[str, Any] = field(default_factory=dict)
     prompt_body: str = ""
+    # Only what CLODEX.md set explicitly (no defaults), so legacy flat keys can
+    # outrank the per-role defaults.
+    user: dict[str, Any] = field(default_factory=dict)
 
     @property
     def max_fix_loops(self) -> int:
@@ -111,9 +118,29 @@ class ClodexConfig:
     def claude(self) -> dict[str, Any]:
         return dict(DEFAULT_CONFIG["claude"] | self.raw.get("claude", {}))
 
+    def claude_role(self, role: str) -> dict[str, Any]:
+        """Effective Claude settings for `plan` or `audit`.
+
+        Precedence, lowest to highest: built-in role defaults, flat `claude.*` keys in
+        CLODEX.md (the pre-0.2 layout, which drove both roles), then `claude.<role>.*`.
+        """
+        defaults = DEFAULT_CONFIG["claude"]
+        user = self.user.get("claude")
+        user = user if isinstance(user, dict) else {}
+        flat = {key: value for key, value in user.items() if key not in ROLES}
+        explicit = user.get(role)
+        explicit = explicit if isinstance(explicit, dict) else {}
+        return {"permission_mode": defaults["permission_mode"], **defaults[role], **flat, **explicit}
+
     @property
     def codex(self) -> dict[str, Any]:
         return dict(DEFAULT_CONFIG["codex"] | self.raw.get("codex", {}))
+
+    def codex_role(self, role: str) -> dict[str, Any]:
+        """Codex settings for a role; `codex.audit.*` overrides model/effort for audits."""
+        base = {key: value for key, value in self.codex.items() if key not in ROLES}
+        override = self.codex.get(role)
+        return {**base, **(override if isinstance(override, dict) else {})}
 
     @property
     def audit(self) -> dict[str, Any]:
@@ -152,7 +179,7 @@ def load_config(repo_root: Path | None = None) -> ClodexConfig:
     parsed = parse_front_matter(front_matter, str(contract))
     merged = deep_merge(DEFAULT_CONFIG, parsed)
     warn_if_model_retiring(str(merged["codex"].get("model", "")))
-    return ClodexConfig(repo_root=root, raw=merged, prompt_body=body.strip())
+    return ClodexConfig(repo_root=root, raw=merged, prompt_body=body.strip(), user=parsed)
 
 
 def split_front_matter(text: str) -> tuple[str, str]:

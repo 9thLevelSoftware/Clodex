@@ -73,7 +73,7 @@ Return only one JSON object:
   "persona": "{selected_persona}",
   "summary": "short verdict",
   "findings": [
-    {{"severity": "high|medium|low", "file": "path", "line": 1, "message": "finding"}}
+    {{"severity": "critical|high|medium|low|info", "file": "path or null", "line": 1, "message": "finding"}}
   ],
   "required_fixes": ["specific fix"]
 }}

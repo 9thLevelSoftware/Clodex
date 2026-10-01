@@ -21,7 +21,8 @@ Harness commands:
 
 Defaults:
 
-- Claude planner/auditor: `claude -p --model opus --effort max --permission-mode plan`.
+- Claude planner: `claude -p --model opus --effort max --permission-mode plan` (JSON via `--json-schema`).
+- Claude auditor: the same with `--effort high`. Set `claude.plan.*` / `claude.audit.*` in `CLODEX.md` to change either.
 - Codex engineer/auditor: `codex exec` (builds and audits) with `gpt-6.1-sol` and `model_reasoning_effort="xhigh"`.
 - Builds default to `.clodex/workspaces/<run-id>/`; use `--workspace local` only when in-place changes are intentional.
 - Approval profiles are `ci`, `local`, and `auto_review`; `ci` is the deterministic default.

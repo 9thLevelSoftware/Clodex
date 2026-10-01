@@ -4,7 +4,7 @@ Clodex is a native collaboration layer for **Claude Code CLI** and **Codex CLI**
 It installs repo instructions and MCP tools that let either agent hand work to
 the other without the user manually driving every step.
 
-- **Claude Code** plans first with Opus at max effort.
+- **Claude Code** plans first with Opus at max effort and audits at high effort.
 - **Codex** implements from that accepted plan with GPT-6.1 Sol at xhigh reasoning.
 - **Both agents audit the same final diff hash** and must agree before the task
   is considered complete.
@@ -132,9 +132,13 @@ prompt body. Defaults:
 
 ```yaml
 claude:
-  model: opus
-  effort: max
   permission_mode: plan
+  plan:
+    model: opus
+    effort: max
+  audit:
+    model: opus
+    effort: high
 codex:
   model: gpt-6.1-sol
   reasoning_effort: xhigh
