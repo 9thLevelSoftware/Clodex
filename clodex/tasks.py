@@ -46,7 +46,7 @@ class TaskManager:
                 {"workspace": selected_workspace, "approval_profile": selected_profile},
             )
 
-        artifacts = ArtifactStore(self.config, run_id)
+        artifacts = ArtifactStore(self.config, run_id, self.state)
         self.state.upsert_task(task_id, task, "queued")
         self.state.create_run(run_id, task_id, task, "queued", artifacts_dir=str(artifacts.path))
         stdout = (artifacts.path / "worker.stdout.log").open("w", encoding="utf-8")

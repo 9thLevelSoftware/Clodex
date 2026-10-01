@@ -57,7 +57,7 @@ class ClodexWorkflow:
 
         task_id = make_task_id(task)
         run_id = make_run_id(task_id)
-        artifacts = ArtifactStore(self.config, run_id)
+        artifacts = ArtifactStore(self.config, run_id, self.state)
         trace = TraceWriter(artifacts.path, run_id, self.state if self.config.tracing.get("enabled") else None)
         self.state.upsert_task(task_id, task, "planning")
         self.state.create_run(run_id, task_id, task, "planning", artifacts_dir=str(artifacts.path))
@@ -99,7 +99,7 @@ class ClodexWorkflow:
 
         task_id = make_task_id(task)
         run_id = make_run_id(task_id)
-        artifacts = ArtifactStore(self.config, run_id)
+        artifacts = ArtifactStore(self.config, run_id, self.state)
         self.state.upsert_task(task_id, task, "running")
         self.state.create_run(run_id, task_id, task, "running", artifacts_dir=str(artifacts.path))
         return self._execute_build(task, task_id, run_id, artifacts, workspace_backend, approval_profile, apply_changes)
@@ -114,7 +114,7 @@ class ClodexWorkflow:
         run = self.state.get_run(run_id)
         if run is None:
             raise ValueError(f"Unknown run: {run_id}")
-        artifacts = ArtifactStore(self.config, run_id)
+        artifacts = ArtifactStore(self.config, run_id, self.state)
         return self._execute_build(str(run["prompt"]), str(run["task_id"]), run_id, artifacts, workspace_backend, approval_profile, apply_changes)
 
     def audit(self, dry_run: bool = False) -> WorkflowResult:
@@ -123,7 +123,7 @@ class ClodexWorkflow:
         task = "Audit current uncommitted changes"
         task_id = make_task_id(task)
         run_id = make_run_id(task_id)
-        artifacts = ArtifactStore(self.config, run_id)
+        artifacts = ArtifactStore(self.config, run_id, self.state)
         trace = TraceWriter(artifacts.path, run_id, self.state if self.config.tracing.get("enabled") else None)
         self.state.upsert_task(task_id, task, "auditing")
         self.state.create_run(run_id, task_id, task, "auditing", workspace_path=str(self.repo_root), artifacts_dir=str(artifacts.path))

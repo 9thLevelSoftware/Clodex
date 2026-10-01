@@ -10,6 +10,12 @@ from typing import Any
 
 TERMINAL_STATUSES = {"approved", "blocked", "failed", "cancelled", "applied", "completed"}
 HANDOFF_REASON_STATUSES = {"blocked", "failed"}
+HANDOFF_PHASES = {"planning", "implementation", "audit", "fix", "decision", "done"}
+HANDOFF_ACTIVE_STATUSES = {"handoff"} | HANDOFF_REASON_STATUSES
+# A finished run stays finished, except that it can then be applied (an approved run
+# normally; any other finished run via `apply --force`). This also stops a late worker
+# from overwriting a cancellation.
+TERMINAL_EXITS: dict[str, set[str]] = {status: {"applied"} for status in ("approved", "blocked", "failed", "cancelled")}
 HANDOFF_REJECTED_STATUSES = TERMINAL_STATUSES - HANDOFF_REASON_STATUSES
 
 
@@ -220,6 +226,12 @@ class StateStore:
         timestamp = now_iso()
         completed = timestamp if status in TERMINAL_STATUSES else None
         with self.session() as con:
+            con.execute("begin immediate")
+            row = con.execute("select status from runs where id=?", (run_id,)).fetchone()
+            if row is not None:
+                current = str(row["status"])
+                if current in TERMINAL_STATUSES and status != current and status not in TERMINAL_EXITS.get(current, set()):
+                    raise ValueError(f"illegal run transition: {current} -> {status} ({run_id})")
             con.execute(
                 """
                 update runs set
@@ -290,6 +302,10 @@ class StateStore:
         requested_reason = _reason_text(blocked_reason) or _report_reason(report)
         if status in HANDOFF_REJECTED_STATUSES:
             raise ValueError(f"handoff status cannot be set via update_handoff: {status}")
+        if status is not None and status not in HANDOFF_ACTIVE_STATUSES:
+            raise ValueError(f"unknown handoff status: {status} (use one of {sorted(HANDOFF_ACTIVE_STATUSES)})")
+        if phase is not None and phase not in HANDOFF_PHASES:
+            raise ValueError(f"unknown handoff phase: {phase} (use one of {sorted(HANDOFF_PHASES)})")
 
         with self.session() as con:
             con.execute("begin immediate")
@@ -480,6 +496,8 @@ class StateStore:
 
     def add_artifact(self, run_id: str, name: str, path: str, kind: str) -> None:
         with self.session() as con:
+            # Files like 05-agreement.json are rewritten every attempt; keep one row per name.
+            con.execute("delete from artifacts where run_id=? and name=?", (run_id, name))
             con.execute(
                 "insert into artifacts(run_id, name, path, kind, created_at) values (?, ?, ?, ?, ?)",
                 (run_id, name, path, kind, now_iso()),
@@ -513,7 +531,11 @@ class StateStore:
                 """,
                 (run_id, now_iso()),
             )
-            con.execute("update runs set status=?, updated_at=? where id=? and status not in ('approved','blocked','failed','cancelled')", ("cancel_requested", now_iso(), run_id))
+            marks = ",".join("?" for _ in TERMINAL_STATUSES)
+            con.execute(
+                f"update runs set status=?, updated_at=? where id=? and status not in ({marks})",
+                ("cancel_requested", now_iso(), run_id, *sorted(TERMINAL_STATUSES)),
+            )
 
     def cancellation_requested(self, run_id: str) -> bool:
         with self.session() as con:
@@ -521,10 +543,16 @@ class StateStore:
             return bool(row and row["requested"])
 
     def complete_cancel(self, run_id: str) -> None:
+        """Mark an unfinished run cancelled. A run that already finished keeps its status."""
         timestamp = now_iso()
+        marks = ",".join("?" for _ in TERMINAL_STATUSES)
         with self.session() as con:
-            con.execute("update cancellations set completed_at=? where run_id=?", (timestamp, run_id))
-            con.execute("update runs set status=?, completed_at=?, updated_at=? where id=?", ("cancelled", timestamp, timestamp, run_id))
+            cursor = con.execute(
+                f"update runs set status=?, completed_at=?, updated_at=? where id=? and status not in ({marks})",
+                ("cancelled", timestamp, timestamp, run_id, *sorted(TERMINAL_STATUSES)),
+            )
+            if cursor.rowcount:
+                con.execute("update cancellations set completed_at=? where run_id=?", (timestamp, run_id))
 
     def list_tasks(self) -> list[dict[str, Any]]:
         with self.session() as con:

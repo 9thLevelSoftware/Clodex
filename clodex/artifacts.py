@@ -28,16 +28,23 @@ def make_run_id(task_id: str) -> str:
 
 
 class ArtifactStore:
-    def __init__(self, config: ClodexConfig, run_id: str):
+    def __init__(self, config: ClodexConfig, run_id: str, state: Any = None):
         self.config = config
         self.run_id = run_id
+        self.state = state
         self.path = config.runs_root / run_id
         self.path.mkdir(parents=True, exist_ok=True)
+
+    def _record(self, name: str, path: Path) -> None:
+        """Index the file in the state ledger so `handoff_get` and exports can find it."""
+        if self.state is not None:
+            self.state.add_artifact(self.run_id, name, str(path), path.suffix.lstrip(".") or "file")
 
     def write_json(self, name: str, data: dict[str, Any]) -> Path:
         path = self.path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record(name, path)
         return path
 
     def write_text(self, name: str, text: str, exact: bool = False) -> Path:
@@ -48,6 +55,7 @@ class ArtifactStore:
             path.write_bytes(text.encode("utf-8", errors="surrogateescape"))
         else:
             path.write_text(text, encoding="utf-8")
+        self._record(name, path)
         return path
 
 
