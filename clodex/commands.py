@@ -4,6 +4,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import capabilities
 from .config import ClodexConfig
 from .schemas import compact_schema, schema_path
 
@@ -65,11 +66,11 @@ def _claude_command(name: str, config: ClodexConfig, role: str, schema_name: str
         "json",
     ]
     fallback = settings.get("fallback_model")
-    if fallback:
+    if fallback and capabilities.supports(config.repo_root, "claude", "--fallback-model") is not False:
         argv.extend(["--fallback-model", ",".join(fallback) if isinstance(fallback, (list, tuple)) else str(fallback)])
-    if settings.get("max_budget_usd") not in (None, ""):
+    if settings.get("max_budget_usd") not in (None, "") and capabilities.supports(config.repo_root, "claude", "--max-budget-usd") is not False:
         argv.extend(["--max-budget-usd", str(settings["max_budget_usd"])])
-    if inline_schema_supported(settings.get("json_schema", "auto")):
+    if inline_schema_supported(settings.get("json_schema", "auto")) and capabilities.supports(config.repo_root, "claude", "--json-schema") is not False:
         argv.extend(["--json-schema", compact_schema(schema_name)])
     return AgentCommand(name=name, argv=argv, schema_name=schema_name)
 
@@ -107,26 +108,29 @@ def codex_review_command(config: ClodexConfig, repo_root: Path) -> AgentCommand:
     # --output-schema, so audits run as a read-only `codex exec`; the audit prompt
     # already embeds the diff.
     codex = config.codex_role("audit")
+    argv = [
+        "codex",
+        "exec",
+        "-m",
+        str(codex["model"]),
+        "-c",
+        f'model_reasoning_effort="{codex["reasoning_effort"]}"',
+        "-c",
+        'approval_policy="never"',
+        "--sandbox",
+        "read-only",
+        "--ephemeral",
+        "-C",
+        str(repo_root),
+    ]
+    # An older Codex without these flags still works: the prompt asks for JSON, stdout is
+    # parsed, and the reply is validated against the schema either way.
+    if capabilities.supports(config.repo_root, "codex", "--output-schema") is not False:
+        argv.extend(["--output-schema", str(schema_path("audit_verdict"))])
+    argv.append("-")
     return AgentCommand(
         name="codex-audit",
-        argv=[
-            "codex",
-            "exec",
-            "-m",
-            str(codex["model"]),
-            "-c",
-            f'model_reasoning_effort="{codex["reasoning_effort"]}"',
-            "-c",
-            'approval_policy="never"',
-            "--sandbox",
-            "read-only",
-            "--ephemeral",
-            "-C",
-            str(repo_root),
-            "--output-schema",
-            str(schema_path("audit_verdict")),
-            "-",
-        ],
+        argv=argv,
         schema_name="audit_verdict",
-        capture_last_message=True,
+        capture_last_message=capabilities.supports(config.repo_root, "codex", "--output-last-message") is not False,
     )

@@ -13,6 +13,7 @@ from .artifacts import ArtifactStore, current_diff, hash_text, make_run_id, make
 from .commands import claude_audit_command, claude_plan_command, codex_exec_command, codex_review_command
 from .config import ClodexConfig, load_config
 from .jsonutil import AgentEnvelopeError, extract_json_object
+from .models import ensure_usable
 from .prompts import audit_diff_excerpt, audit_prompt, fix_prompt, implementation_prompt, plan_prompt
 from .quorum import evaluate as evaluate_quorum, required_fixes, verdict_approved
 from .schemas import SchemaValidationError, check as check_schema
@@ -97,6 +98,7 @@ class ClodexWorkflow:
                 },
             )
 
+        ensure_usable(self.config)
         task_id = make_task_id(task)
         run_id = make_run_id(task_id)
         artifacts = ArtifactStore(self.config, run_id, self.state)
@@ -115,11 +117,19 @@ class ClodexWorkflow:
         if run is None:
             raise ValueError(f"Unknown run: {run_id}")
         artifacts = ArtifactStore(self.config, run_id, self.state)
+        try:
+            ensure_usable(self.config)
+        except ValueError as exc:
+            # The worker was already started; record why instead of leaving the run queued.
+            self.state.update_run(run_id, "failed", error=str(exc))
+            self.state.update_task(str(run["task_id"]), "failed")
+            return WorkflowResult("failed", run_id, str(run["task_id"]), str(artifacts.path), {"error": str(exc)})
         return self._execute_build(str(run["prompt"]), str(run["task_id"]), run_id, artifacts, workspace_backend, approval_profile, apply_changes)
 
     def audit(self, dry_run: bool = False) -> WorkflowResult:
         if dry_run:
             return WorkflowResult("dry-run", None, None, None, {"commands": self.dry_run_commands()})
+        ensure_usable(self.config)
         task = "Audit current uncommitted changes"
         task_id = make_task_id(task)
         run_id = make_run_id(task_id)

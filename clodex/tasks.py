@@ -11,6 +11,7 @@ from typing import Any
 
 from .artifacts import ArtifactStore, make_run_id, make_task_id
 from .config import ClodexConfig, load_config
+from .models import ensure_usable
 from .procs import kill_tree, pid_alive, popen_isolation_kwargs
 from .state import TERMINAL_STATUSES, StateStore
 from .workflow import WorkflowResult
@@ -80,6 +81,8 @@ class TaskManager:
         approval_profile: str | None = None,
         dry_run: bool = False,
     ) -> WorkflowResult:
+        if not dry_run:
+            ensure_usable(self.config)
         task_id = make_task_id(task)
         run_id = make_run_id(task_id)
         selected_workspace = workspace_backend or self.config.workspace["backend"]

@@ -111,7 +111,8 @@ PowerShell:
 | `clodex init` | Install native Claude/Codex instructions and MCP config |
 | `clodex native status` | Show native instruction and MCP config state |
 | `clodex native doctor` | Run native setup checks, CLI readiness, and launcher checks |
-| `clodex doctor` | Check Python, git, Claude Code, Codex, and `CLODEX.md` |
+| `clodex doctor [--strict]` | Check Python, git, both CLIs (login, supported flags), the live Codex model catalog, and `CLODEX.md` settings; `--strict` fails on warnings |
+| `clodex init --migrate [--split-claude] [--dry-run]` | Update `CLODEX.md` settings that no longer work (retired models, unsupported efforts) |
 | `clodex plan "<task>"` | Run Claude planning only |
 | `clodex build "<task>"` | Run plan, implementation, and dual audit loop in an isolated worktree |
 | `clodex audit --diff` | Audit current uncommitted changes |
@@ -174,6 +175,23 @@ Use `--workspace local` for compatibility with the earlier in-place behavior.
 approved diff hash; a local-workspace run is reported as already in the working tree. A run
 that fails unexpectedly is marked `failed` (traceback in `error.txt`) and its worktree is
 removed; approved and blocked runs keep theirs until `clodex clean <run-id>`.
+
+### Models and `clodex doctor`
+
+`clodex doctor` validates the configuration against what is actually installed:
+
+- **Models:** retired Codex models are errors, ones retiring soon are warnings (both name the
+  replacement). Efforts are checked against the live catalog (`codex debug models`, cached for
+  24h in `.clodex/models-cache.json`), so a stale `reasoning_effort` is caught before a run.
+- **CLI flags:** the installed `claude` and `codex` are probed once per version
+  (`.clodex/capabilities.json`). Missing optional flags (`--json-schema`, `--output-schema`, ...)
+  are warnings and Clodex simply runs without them; missing required flags are errors.
+- **Login:** `claude auth status` and `codex login status`.
+- **Settings:** reviewers, quorum, sandbox, approval profile and workspace backend.
+
+`clodex build`, `audit` and `task start` refuse to start on a retired Codex model
+(`clodex init --migrate` fixes the file; `CLODEX_ALLOW_RETIRED_MODEL=1` overrides). Migration edits
+only the YAML front matter, keeps comments and line endings, and is safe to re-run.
 
 ### Audit quorum
 

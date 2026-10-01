@@ -6,10 +6,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .config import ConfigError
 from .doctor import run_doctor
 from .evals import run_local_evals
 from .hooks import hook_config, ingest_hook_event
 from .mcp_server import main as mcp_main
+from .migrate import migrate_contract
+from .models import ModelRetiredError
 from .native import (
     ManagedBlockError,
     apply_native_install,
@@ -22,17 +25,44 @@ from .workflow import ClodexWorkflow
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except (ConfigError, ModelRetiredError) as exc:
+        print(f"clodex: error: {exc}", file=sys.stderr)
+        return 2
+
+
+def handle_migrate(args: argparse.Namespace) -> int:
+    contract = Path.cwd() / "CLODEX.md"
+    if not contract.is_file():
+        print_output({"ok": False, "error": f"{contract} not found"}, args.json)
+        return 1
+    with contract.open(encoding="utf-8", newline="") as handle:  # keep CRLF endings as they are
+        text = handle.read()
+    migrated, changes = migrate_contract(text, split_claude=args.split_claude)
+    written = bool(changes) and not args.dry_run
+    if written:
+        with contract.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(migrated)
+    print_output({"ok": True, "file": str(contract), "changes": changes, "dry_run": args.dry_run, "written": written}, args.json)
+    return 0
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="clodex", description="Claude Code + Codex CLI workflow orchestrator")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON where supported")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("doctor", help="Check local Clodex, Claude Code, Codex, and git readiness")
+    doctor = sub.add_parser("doctor", help="Check local Clodex, Claude Code, Codex, and git readiness")
+    doctor.add_argument("--strict", action="store_true", help="Treat warnings (e.g. a model retiring soon) as failures")
 
     init = sub.add_parser("init", help="Install native Claude Code and Codex collaboration instructions")
     init.add_argument("--global", action="store_true", dest="global_mode")
     init.add_argument("--dry-run", action="store_true")
     init.add_argument("--no-mcp-config", action="store_true")
     init.add_argument("--force", action="store_true")
+    init.add_argument("--migrate", action="store_true", help="Update CLODEX.md settings that no longer work (retired models, unsupported efforts)")
+    init.add_argument("--split-claude", action="store_true", help="With --migrate: split flat claude.model/effort into plan and audit roles")
 
     native = sub.add_parser("native", help="Inspect native Clodex setup")
     native_sub = native.add_subparsers(dest="native_command", required=True)
@@ -120,9 +150,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "mcp-server":
         return mcp_main()
     if args.command == "doctor":
-        exit_code, data = run_doctor()
+        exit_code, data = run_doctor(strict=args.strict)
         print_output(data, args.json)
         return exit_code
+    if args.command == "init" and args.migrate:
+        return handle_migrate(args)
     if args.command == "init":
         try:
             exit_code = 0
