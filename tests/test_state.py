@@ -20,7 +20,7 @@ class StateTests(unittest.TestCase):
             self.assertIn("artifacts", tables)
             self.assertIn("workspace_locks", tables)
             self.assertIn("cancellations", tables)
-            self.assertEqual(store.schema_version(), 2)
+            self.assertEqual(store.schema_version(), 3)
 
     def test_state_migrations_add_native_handoff_columns(self):
         with tempfile.TemporaryDirectory() as tmp:

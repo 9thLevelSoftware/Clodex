@@ -7,12 +7,14 @@ import subprocess
 import sys
 import threading
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .config import resolve_repo_root
+from .delegate import DelegationManager, WaitAborted
 from .quorum import evaluate_handoff, resolve_reviewer
 from .schemas import validate as validate_schema
 from .tasks import TaskManager
@@ -142,6 +144,27 @@ TOOLS = [
         "title": "Get Clodex handoff",
         "description": "Read native handoff state, events, artifacts, budget, and next actor.",
         "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]},
+    },
+    {
+        "name": "clodex_delegate",
+        "title": "Delegate to Codex",
+        "description": (
+            "Hand a native handoff's work to Codex, which runs in the handoff's isolated worktree and records its result on the handoff. "
+            "mode `implement` (needs `instructions`: the plan to carry out), `fix` (applies the open review findings plus any `instructions`) "
+            "or `audit` (Codex reviews the diff and records its verdict). Returns at once with a delegation to poll via clodex_handoff_get; "
+            "pass `wait: true` to block until it finishes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "mode": {"type": "string", "enum": ["implement", "fix", "audit"]},
+                "instructions": {"type": "string"},
+                "approval_profile": {"type": "string", "enum": ["ci", "local", "auto_review"]},
+                "wait": {"type": "boolean"},
+            },
+            "required": ["run_id"],
+        },
     },
     {
         "name": "clodex_handoff_decide",
@@ -321,6 +344,9 @@ class McpServer:
     def is_blocking(self, method: str, params: Any) -> bool:
         if method == "tasks/result":
             return True  # waits for the task to finish
+        if method == "tools/call" and isinstance(params, dict) and params.get("name") == "clodex_delegate":
+            arguments = params.get("arguments")
+            return isinstance(arguments, dict) and arguments.get("wait") is True  # only waiting blocks
         if method != "tools/call" or not isinstance(params, dict) or params.get("name") not in self.LONG_TOOLS:
             return False
         arguments = params.get("arguments")
@@ -373,7 +399,7 @@ class McpServer:
         if method == "tools/list":
             return {"tools": TOOLS}
         if method == "tools/call":
-            return self.tools_call(params)
+            return self.tools_call(params, lambda: cancelled.is_set() or self._closing.is_set())
         if self.tasks_enabled:
             if method == "tasks/get":
                 return task_object(self.task_run(params))
@@ -402,7 +428,7 @@ class McpServer:
 
     # ------------------------------------------------------------ tools
 
-    def tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
+    def tools_call(self, params: dict[str, Any], should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
         name = params.get("name")
         if not isinstance(name, str):
             raise RpcError(INVALID_PARAMS, "tools/call requires a tool name")
@@ -421,7 +447,10 @@ class McpServer:
             if name not in TASK_TOOLS:
                 raise RpcError(METHOD_NOT_FOUND, f"Tool does not support task augmentation: {name}")
             return self.create_task(name, arguments)
-        return tool_call(name, arguments)
+        try:
+            return tool_call(name, arguments, should_stop)
+        except WaitAborted:
+            raise _Aborted from None
 
     def create_task(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if arguments.get("dry_run"):
@@ -494,7 +523,7 @@ def main() -> int:
     return McpServer().serve(sys.stdin)
 
 
-def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def tool_call(name: str, arguments: dict[str, Any], should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
     root = resolve_repo_root()
     workflow = None if name in TASK_MANAGER_TOOLS else ClodexWorkflow(root)
     if name == "clodex_plan":
@@ -589,9 +618,25 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
             return call_text(expected_handoff_error(exc), is_error=True)
         return call_json(run, is_error=run.get("status") == "blocked")
+    elif name == "clodex_delegate":
+        manager = DelegationManager(root)
+        try:
+            delegation = manager.start(
+                str(arguments["run_id"]),
+                instructions=arguments.get("instructions"),
+                mode=str(arguments.get("mode") or "implement"),
+                approval_profile=arguments.get("approval_profile"),
+            )
+            if arguments.get("wait") is True:
+                delegation = manager.wait(int(delegation["id"]), should_stop=should_stop)
+        except (ValueError, DirtyWorkspaceError, subprocess.CalledProcessError) as exc:
+            return call_text(expected_handoff_error(exc), is_error=True)
+        failed = delegation["status"] in {"failed", "cancelled"}
+        return call_json({"delegation": delegation, "handoff": brief_handoff(manager.state, str(arguments["run_id"]))}, is_error=failed)
     elif name == "clodex_handoff_get":
         try:
             run_id = str(required_argument(arguments, "run_id"))
+            DelegationManager(root).reconcile_active(run_id)
             data = workflow.state.get_handoff(run_id)
         except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
             return call_text(expected_handoff_error(exc), is_error=True)
@@ -651,6 +696,23 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     else:
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
     return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": result.status == "blocked"}
+
+
+def brief_handoff(state: Any, run_id: str) -> dict[str, Any]:
+    """The few handoff fields an orchestrator needs right after delegating."""
+    data = state.get_handoff(run_id)
+    if data is None:
+        return {}
+    run = data["run"]
+    return {
+        "run_id": run_id,
+        "status": run.get("status"),
+        "phase": run.get("phase"),
+        "diff_hash": run.get("diff_hash"),
+        "workspace_path": run.get("workspace_path"),
+        "budget_remaining": data["budget_remaining"],
+        "next_expected_actor": data["next_expected_actor"],
+    }
 
 
 def call_text(text: str, is_error: bool = False) -> dict[str, Any]:

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, resolve_repo_root
+from .delegate import run_delegation
 from .doctor import run_doctor
 from .evals import run_local_evals
 from .hooks import derive_run_id, hook_config, ingest_hook_event, install_hooks, parse_hook_payload
@@ -112,6 +113,10 @@ def _main(argv: list[str] | None = None) -> int:
     task_worker.add_argument("run_id")
     task_worker.add_argument("--workspace", choices=["git-worktree", "local"])
     task_worker.add_argument("--approval-profile", choices=["ci", "local", "auto_review"])
+    task_delegate = task_sub.add_parser("delegate-worker", help="Internal: run one delegated Codex job for a native handoff")
+    task_delegate.add_argument("run_id")
+    task_delegate.add_argument("delegation_id", type=int)
+    task_delegate.add_argument("--approval-profile", choices=["ci", "local", "auto_review"])
 
     queue = sub.add_parser("queue", help="Manage the local task ledger")
     queue_sub = queue.add_subparsers(dest="queue_command", required=True)
@@ -297,6 +302,12 @@ def handle_task(args: argparse.Namespace, workflow: ClodexWorkflow, as_json: boo
     if args.task_command == "list":
         print_output(manager.list(), as_json)
         return 0
+    if args.task_command == "delegate-worker":
+        delegation_id = args.delegation_id
+        with Heartbeat(workflow.state, delegation_id, beat=lambda: workflow.state.touch_delegation(delegation_id)):
+            delegation = run_delegation(resolve_repo_root(), args.run_id, delegation_id)
+        print_output(delegation, as_json)
+        return 0 if delegation.get("status") == "completed" else 1
     if args.task_command == "worker":
         with Heartbeat(workflow.state, args.run_id):
             result = workflow.run_existing(args.run_id, workspace_backend=args.workspace, approval_profile=args.approval_profile)

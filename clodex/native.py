@@ -52,13 +52,14 @@ Codex is the default engineer for implementation, fixes, and focused audit work.
 
 When a user asks for non-trivial design, implementation, debugging, refactoring, or review work:
 
-1. Prefer the MCP tool `clodex_handoff_create` to create or resume a durable handoff.
-2. Use `clodex_handoff_get` before acting on an existing handoff.
-3. Produce the plan, design, acceptance criteria, risks, and test commands before implementation.
-4. Delegate implementation-oriented work to Codex through Clodex instead of manually telling the user to run Codex.
-5. Use `clodex_handoff_update` to record plan artifacts, phase changes, review notes, changed files, tests, unresolved issues, and diff hashes.
-6. Use `clodex_handoff_decide` before claiming completion when Codex has implemented or audited changes.
-7. Stop and summarize for the user when Clodex reports `blocked`.
+1. Prefer the MCP tool `clodex_handoff_create` to create or resume a durable handoff. Pass `workspace: "git-worktree"` so Codex works in an isolated checkout.
+2. Use `clodex_handoff_get` before acting on an existing handoff; it shows the budget, the next expected actor, and any running delegation.
+3. Produce the plan, design, acceptance criteria, risks, and test commands before implementation, and record them with `clodex_handoff_update`.
+4. Delegate implementation to Codex with `clodex_delegate` (mode `implement`, `instructions` = the accepted plan) instead of telling the user to run Codex. Pass `wait: true`, or poll `clodex_handoff_get`.
+5. Review the diff in the handoff's workspace, then record your verdict with `clodex_handoff_update` (actor `claude`, the diff hash from `clodex_handoff_get`, `report.approved`, `report.required_fixes`).
+6. Ask Codex for its verdict with `clodex_delegate` mode `audit`. If anyone rejected, use mode `fix` (it applies the open findings) and audit again; approvals only count for the exact diff they name.
+7. Use `clodex_handoff_decide` before claiming completion. `approved` means the configured reviewers agree on this exact diff; then `clodex apply <run-id>` brings it into the main checkout.
+8. Stop and summarize for the user when Clodex reports `blocked`.
 
 Default role contract:
 
@@ -95,6 +96,7 @@ When Clodex context is present:
 6. Use `clodex_handoff_decide` before claiming completion after implementation or audit work.
 7. Ask for clarification through Clodex when product intent or acceptance criteria are unclear.
 8. Respect owner, phase, and handoff budget state. When the budget is exhausted, summarize the disagreement for the user.
+9. When Clodex delegates work to you it runs `codex exec` in the handoff's workspace and records your result itself, so you do not need to call the handoff tools in that case; just do the work and finish with a concise report.
 
 Default role contract:
 

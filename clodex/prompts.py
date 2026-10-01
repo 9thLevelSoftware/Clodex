@@ -108,3 +108,28 @@ def audit_diff_excerpt(diff: str, max_bytes: int) -> str:
         f"Changed files ({len(files)}): {', '.join(files)}. "
         "Reject if the omitted part could hide a problem you cannot rule out.]\n"
     )
+
+
+def delegate_prompt(mode: str, task: str, instructions: str | None, fixes: list[str] | None = None) -> str:
+    """The prompt for a Codex job a native handoff delegated (implement or fix)."""
+    lines = [
+        "You are the Codex engineering wave for Clodex, working a native Claude/Codex handoff.",
+        "",
+        "Work only inside the current directory: it is an isolated checkout made for this handoff. "
+        "Keep changes scoped, preserve existing user changes, add or update tests where appropriate, and run the relevant verification.",
+        "",
+        "Original task:",
+        task,
+    ]
+    if instructions:
+        lines += ["", "Instructions from Claude:", instructions]
+    if mode == "fix":
+        lines += ["", "Required fixes:", json.dumps(fixes or ["Resolve the open review findings."], indent=2), "", "Apply only the required fixes. Do not broaden scope."]
+    lines += [
+        "",
+        "When finished, print a concise Markdown report with:",
+        "- files changed",
+        "- tests run and pass/fail status",
+        "- unresolved issues, if any",
+    ]
+    return "\n".join(lines) + "\n"

@@ -82,6 +82,7 @@ Native coordination uses these MCP tools:
 - `clodex_handoff_update`
 - `clodex_handoff_get`
 - `clodex_handoff_decide`
+- `clodex_delegate`
 
 If MCP is unavailable, use the CLI fallbacks:
 
@@ -308,6 +309,35 @@ The server speaks MCP `2025-11-25` (and negotiates down to `2025-06-18`, `2025-0
   well as the default uncommitted diff.
 
 ### Native handoffs
+
+The loop an orchestrating agent follows:
+
+```text
+clodex_handoff_create (workspace: git-worktree)
+  -> clodex_handoff_update   record the plan
+  -> clodex_delegate implement   Codex implements in the isolated worktree
+  -> clodex_handoff_update   Claude's own verdict on the diff
+  -> clodex_delegate audit       Codex's verdict (schema-constrained), recorded for you
+  -> clodex_delegate fix + audit again   if anyone rejected
+  -> clodex_handoff_decide  ->  clodex apply <run-id>
+```
+
+**`clodex_delegate`** (`run_id`, `mode`, `instructions`, `approval_profile`, `wait`) starts a
+worker that runs Codex in the handoff's workspace and records the outcome on the handoff, because a
+non-interactive `codex exec` has no MCP access to report for itself:
+
+- `implement` carries out `instructions` (required); `fix` applies the open findings of reviewers
+  that have not approved the latest diff, plus any `instructions`; `audit` has Codex review the
+  diff and records its verdict for the first required Codex reviewer, on the diff it actually saw.
+- It returns immediately with a delegation to poll through `clodex_handoff_get` (which now shows
+  `delegations`); `wait: true` blocks until it finishes without stalling other requests.
+- Only one delegation runs per handoff. A successful implement/fix/audit counts as one handoff
+  against the budget; a failed job does not, and is reported on the handoff so the orchestrator
+  can decide. A worker that dies is detected and its delegation marked failed.
+- Cancelling the handoff (`clodex_task_cancel` / `clodex task cancel`) stops the worker and
+  everything it started, and removes the worktree.
+- If the handoff has no workspace, an isolated worktree is created on first use. A retired Codex
+  model is refused up front.
 
 - **Decisions follow your audit settings.** `clodex_handoff_decide` evaluates the reports recorded
   with `clodex_handoff_update` against the same `audit.reviewers` and `audit.quorum` as a classic

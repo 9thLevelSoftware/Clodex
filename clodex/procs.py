@@ -10,7 +10,38 @@ import os
 import signal
 import subprocess
 import time
+from datetime import UTC, datetime
 from pathlib import Path
+
+
+HEARTBEAT_INTERVAL = 5.0
+# A live worker beats every few seconds; a pid with an older heartbeat is probably a
+# reused pid, so it is never signalled.
+STALE_AFTER = 60.0
+START_GRACE = 30.0
+
+
+def parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def worker_state(pid: int | None, heartbeat_at: str | None, started_at: str | None) -> str:
+    """`none` (no worker), `dead`, `stale` (alive pid but no recent heartbeat) or `alive`."""
+    if not pid:
+        return "none"
+    if not pid_alive(int(pid)):
+        return "dead"
+    heartbeat = parse_time(heartbeat_at)
+    reference = heartbeat or parse_time(started_at)
+    limit = STALE_AFTER if heartbeat else START_GRACE
+    if reference is not None and (datetime.now(UTC) - reference).total_seconds() > limit:
+        return "stale"
+    return "alive"
 
 
 def popen_isolation_kwargs() -> dict[str, object]:

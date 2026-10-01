@@ -83,6 +83,7 @@ class FakeCliPath:
         claude_logged_in: bool = True,
         codex_logged_in: bool = True,
         codex_catalog: dict | None = None,
+        codex_fails: bool = False,
     ):
         self.reject_once = reject_once
         self.malformed_once = malformed_once
@@ -96,6 +97,7 @@ class FakeCliPath:
         self.claude_logged_in = claude_logged_in
         self.codex_logged_in = codex_logged_in
         self.codex_catalog = codex_catalog
+        self.codex_fails = codex_fails
         self.sleep_seconds = sleep_seconds
         self.include_clodex = include_clodex
 
@@ -307,6 +309,9 @@ if name == 'codex':
         fail('error: invalid sandbox ' + sandbox)
     if '-C' in flags:
         os.chdir(flags['-C'][-1])
+    if {self.codex_fails!r} and 'adversarial auditor' not in stdin:
+        sys.stderr.write('simulated codex crash\\n')
+        raise SystemExit(5)
 
     def finish(text):
         out = flags.get('-o') or flags.get('--output-last-message')

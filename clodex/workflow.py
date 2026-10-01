@@ -397,6 +397,10 @@ class ClodexWorkflow:
             artifacts.write_json("04-codex-audit.json", first_codex)
         return verdicts
 
+    def run_agent_json(self, runner: AgentRunner, command, prompt: str, label: str, timeout: int | None = None) -> dict[str, Any]:
+        """Run an agent command and return its JSON answer (validated against the command's schema, retried once)."""
+        return self._run_json_with_retry(runner, command, prompt, label, None, timeout=timeout)
+
     def _run_json_with_retry(
         self,
         runner: AgentRunner,

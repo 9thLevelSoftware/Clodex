@@ -10,6 +10,9 @@ from typing import Any
 
 TERMINAL_STATUSES = {"approved", "blocked", "failed", "cancelled", "applied", "completed"}
 HANDOFF_REASON_STATUSES = {"blocked", "failed"}
+DELEGATION_MODES = {"implement", "fix", "audit"}
+DELEGATION_ACTIVE = {"queued", "running"}
+DELEGATION_FINISHED = {"completed", "failed", "cancelled"}
 HANDOFF_PHASES = {"planning", "implementation", "audit", "fix", "decision", "done"}
 HANDOFF_ACTIVE_STATUSES = {"handoff"} | HANDOFF_REASON_STATUSES
 # A finished run stays finished, except that it can then be applied (an approved run
@@ -126,6 +129,22 @@ class StateStore:
                     created_at text not null,
                     released_at text
                 );
+                create table if not exists delegations (
+                    id integer primary key autoincrement,
+                    run_id text not null,
+                    mode text not null,
+                    instructions text,
+                    approval_profile text,
+                    status text not null,
+                    pid integer,
+                    error text,
+                    summary text,
+                    diff_hash text,
+                    created_at text not null,
+                    started_at text,
+                    finished_at text,
+                    heartbeat_at text
+                );
                 create table if not exists cancellations (
                     run_id text primary key,
                     requested integer not null,
@@ -137,10 +156,10 @@ class StateStore:
             self._ensure_run_columns(con)
             current = con.execute("select version from schema_version order by version desc limit 1").fetchone()
             if current is None:
-                con.execute("insert into schema_version(version) values (2)")
-            elif int(current["version"]) < 2:
+                con.execute("insert into schema_version(version) values (3)")
+            elif int(current["version"]) < 3:
                 con.execute("delete from schema_version")
-                con.execute("insert into schema_version(version) values (2)")
+                con.execute("insert into schema_version(version) values (3)")
 
     def _ensure_run_columns(self, con: sqlite3.Connection) -> None:
         existing = {row["name"] for row in con.execute("pragma table_info(runs)")}
@@ -500,6 +519,7 @@ class StateStore:
                 events.append(event)
 
             artifacts = [dict(artifact) for artifact in con.execute("select * from artifacts where run_id=? order by id", (run_id,))]
+            delegations = [dict(item) for item in con.execute("select * from delegations where run_id=? order by id desc limit 5", (run_id,))]
             handoff_count = _int_or_default(run.get("handoff_count"), 0)
             handoff_budget = _int_or_default(run.get("handoff_budget"), 6)
             last_actor = run.get("last_actor")
@@ -513,6 +533,7 @@ class StateStore:
                 "run": run,
                 "events": events,
                 "artifacts": artifacts,
+                "delegations": delegations,
                 "budget_remaining": max(handoff_budget - handoff_count, 0),
                 "next_expected_actor": next_expected_actor,
             }
@@ -575,6 +596,67 @@ class StateStore:
                 f"update runs set heartbeat_at=? where id=? and status not in ({marks})",
                 (now_iso(), run_id, *sorted(TERMINAL_STATUSES)),
             )
+
+    # ------------------------------------------------------------ delegations
+    # A delegation is one Codex job a handoff asked for (implement / fix / audit).
+
+    def start_delegation(self, run_id: str, mode: str, instructions: str | None = None, approval_profile: str | None = None) -> dict[str, Any]:
+        """Record a new delegation unless one is already active for this handoff (atomic)."""
+        if mode not in DELEGATION_MODES:
+            raise ValueError(f"unknown delegation mode: {mode} (use one of {sorted(DELEGATION_MODES)})")
+        timestamp = now_iso()
+        with self.session() as con:
+            con.execute("begin immediate")
+            marks = ",".join("?" for _ in DELEGATION_ACTIVE)
+            active = con.execute(f"select id from delegations where run_id=? and status in ({marks})", (run_id, *sorted(DELEGATION_ACTIVE))).fetchone()
+            if active is not None:
+                raise ValueError(f"a delegation is already running for this handoff (delegation {active['id']})")
+            cursor = con.execute(
+                "insert into delegations(run_id, mode, instructions, approval_profile, status, created_at) values (?, ?, ?, ?, 'queued', ?)",
+                (run_id, mode, instructions, approval_profile, timestamp),
+            )
+            return dict(con.execute("select * from delegations where id=?", (cursor.lastrowid,)).fetchone())
+
+    _DELEGATION_FIELDS = {"status", "pid", "error", "summary", "diff_hash", "started_at", "finished_at"}
+
+    def update_delegation(self, delegation_id: int, **fields: Any) -> dict[str, Any]:
+        unknown = set(fields) - self._DELEGATION_FIELDS
+        if unknown:
+            raise ValueError(f"unknown delegation fields: {sorted(unknown)}")
+        if fields.get("status") in DELEGATION_FINISHED:
+            fields.setdefault("finished_at", now_iso())
+        with self.session() as con:
+            con.execute("begin immediate")
+            row = con.execute("select * from delegations where id=?", (delegation_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"unknown delegation: {delegation_id}")
+            if str(row["status"]) in DELEGATION_FINISHED and fields.get("status") not in (None, row["status"]):
+                return dict(row)  # a finished delegation stays finished (e.g. a worker that outlived a cancel)
+            if fields:
+                assignments = ", ".join(f"{name}=?" for name in fields)
+                con.execute(f"update delegations set {assignments} where id=?", (*fields.values(), delegation_id))
+            return dict(con.execute("select * from delegations where id=?", (delegation_id,)).fetchone())
+
+    def touch_delegation(self, delegation_id: int) -> None:
+        marks = ",".join("?" for _ in DELEGATION_ACTIVE)
+        with self.session() as con:
+            con.execute(f"update delegations set heartbeat_at=? where id=? and status in ({marks})", (now_iso(), delegation_id, *sorted(DELEGATION_ACTIVE)))
+
+    def get_delegation(self, delegation_id: int) -> dict[str, Any] | None:
+        with self.session() as con:
+            row = con.execute("select * from delegations where id=?", (delegation_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_delegations(self, run_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        with self.session() as con:
+            rows = con.execute("select * from delegations where run_id=? order by id desc limit ?", (run_id, limit))
+            return [dict(row) for row in rows]
+
+    def active_delegation(self, run_id: str) -> dict[str, Any] | None:
+        marks = ",".join("?" for _ in DELEGATION_ACTIVE)
+        with self.session() as con:
+            row = con.execute(f"select * from delegations where run_id=? and status in ({marks}) order by id desc limit 1", (run_id, *sorted(DELEGATION_ACTIVE))).fetchone()
+            return dict(row) if row else None
 
     def release_workspace_lock(self, run_id: str) -> None:
         with self.session() as con:
