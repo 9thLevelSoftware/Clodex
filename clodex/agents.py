@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .commands import AgentCommand
+from .procs import kill_tree, popen_isolation_kwargs
 
 
 @dataclass
@@ -47,31 +48,42 @@ class AgentRunner:
             at = len(argv) - 1 if argv and argv[-1] == "-" else len(argv)
             argv[at:at] = ["-o", last_message_path]
         try:
+            # Own process group, so a timeout (or cancel) can stop the agent *and* whatever it spawned.
+            process = subprocess.Popen(
+                argv,
+                cwd=self.repo_root,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **popen_isolation_kwargs(),
+            )
             try:
-                result = subprocess.run(
-                    argv,
-                    cwd=self.repo_root,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                    timeout=timeout,
-                )
-            except subprocess.TimeoutExpired as exc:
+                stdout, stderr = process.communicate(input=prompt, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                kill_tree(process.pid)
+                try:
+                    stdout, stderr = process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = "", ""
                 return AgentResult(
                     command=command,
-                    stdout=_as_text(exc.stdout),
-                    stderr=_as_text(exc.stderr) + f"\ntimed out after {timeout}s",
+                    stdout=stdout or "",
+                    stderr=(stderr or "") + f"\ntimed out after {timeout}s",
                     returncode=124,
                     timed_out=True,
                 )
+            except BaseException:
+                kill_tree(process.pid)
+                raise
             return AgentResult(
                 command=command,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                returncode=result.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=process.returncode,
                 last_message=_read_text(last_message_path),
             )
         finally:
@@ -90,11 +102,3 @@ def _read_text(path: str | None) -> str | None:
     except OSError:
         return None
     return text.strip() or None
-
-
-def _as_text(value: str | bytes | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value

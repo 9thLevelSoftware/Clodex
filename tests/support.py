@@ -118,6 +118,8 @@ stdin = sys.stdin.read()
 
 if {self.sleep_seconds!r}:
     import time
+    # Lets tests find this process (the real agent, behind the .cmd shim) and check it is stopped.
+    Path('.fake-pid-' + name).write_text(str(os.getpid()))
     time.sleep({self.sleep_seconds!r})
 
 def diff_hash():

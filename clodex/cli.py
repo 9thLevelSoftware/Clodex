@@ -17,7 +17,7 @@ from .native import (
     native_status,
     plan_native_install,
 )
-from .tasks import TaskManager
+from .tasks import Heartbeat, TaskManager
 from .workflow import ClodexWorkflow
 
 
@@ -254,7 +254,8 @@ def handle_task(args: argparse.Namespace, workflow: ClodexWorkflow, as_json: boo
         print_output(manager.list(), as_json)
         return 0
     if args.task_command == "worker":
-        result = workflow.run_existing(args.run_id, workspace_backend=args.workspace, approval_profile=args.approval_profile)
+        with Heartbeat(workflow.state, args.run_id):
+            result = workflow.run_existing(args.run_id, workspace_backend=args.workspace, approval_profile=args.approval_profile)
         print_result(result.__dict__, as_json)
         return 0 if result.status not in {"blocked"} else 1
     return 2

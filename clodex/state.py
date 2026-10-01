@@ -157,6 +157,7 @@ class StateStore:
             "handoff_budget": "integer not null default 6",
             "last_actor": "text",
             "blocked_reason": "text",
+            "heartbeat_at": "text",
         }
         for name, kind in columns.items():
             if name not in existing:
@@ -515,6 +516,15 @@ class StateStore:
                     backend=excluded.backend
                 """,
                 (run_id, source_path, workspace_path, backend, now_iso()),
+            )
+
+    def touch_run(self, run_id: str) -> None:
+        """Worker heartbeat: proves the process that owns this run is still alive."""
+        marks = ",".join("?" for _ in TERMINAL_STATUSES)
+        with self.session() as con:
+            con.execute(
+                f"update runs set heartbeat_at=? where id=? and status not in ({marks})",
+                (now_iso(), run_id, *sorted(TERMINAL_STATUSES)),
             )
 
     def release_workspace_lock(self, run_id: str) -> None:
