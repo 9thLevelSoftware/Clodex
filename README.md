@@ -115,7 +115,7 @@ PowerShell:
 | `clodex init --migrate [--split-claude] [--dry-run]` | Update `CLODEX.md` settings that no longer work (retired models, unsupported efforts) |
 | `clodex plan "<task>"` | Run Claude planning only |
 | `clodex build "<task>"` | Run plan, implementation, and dual audit loop in an isolated worktree |
-| `clodex audit --diff` | Audit current uncommitted changes |
+| `clodex audit [--diff \| --base REF \| --commit SHA]` | Audit the uncommitted diff (default), everything since `REF` diverged from `HEAD`, or one commit |
 | `clodex run "<task>"` | Alias for `build` |
 | `clodex apply <run-id>` | Apply an approved worktree patch back to the source checkout (`--check` to dry-run, `--force` for unapproved runs) |
 | `clodex clean <run-id>` | Remove the kept git worktree of a finished run (artifacts and patch stay) |
@@ -176,6 +176,14 @@ approved diff hash; a local-workspace run is reported as already in the working 
 that fails unexpectedly is marked `failed` (traceback in `error.txt`) and its worktree is
 removed; approved and blocked runs keep theirs until `clodex clean <run-id>`.
 
+### Exit codes and output
+
+`0` success; `1` the work was refused or rejected (`blocked`, `apply-refused`, ...); `2` usage or
+configuration error (including unknown run ids and bad git refs, reported as one line; set
+`CLODEX_DEBUG=1` for the traceback); `3` the run failed unexpectedly; `4` it was cancelled.
+Without `--json`, output is plain text; `--json` is the stable machine-readable form. Commands
+find the repository from any subdirectory (or `CLODEX_REPO_ROOT`).
+
 ### Models and `clodex doctor`
 
 `clodex doctor` validates the configuration against what is actually installed:
@@ -226,14 +234,33 @@ The MCP server exposes:
 - `clodex_handoff_get`
 - `clodex_handoff_decide`
 
-The server also handles MCP-style `tasks/get`, `tasks/update`, and
-`tasks/cancel` JSON-RPC methods using the Clodex `run_id` as the task id.
-
 Start it with:
 
 ```bash
 python -m clodex mcp-server
 ```
+
+The server speaks MCP `2025-11-25` (and negotiates down to `2025-06-18`, `2025-03-26` or
+`2024-11-05`). It works on the repository containing its working directory, or the one named by
+`CLODEX_REPO_ROOT`, which is the reliable way to point a client at a project.
+
+- **Tool errors vs protocol errors:** wrong or missing tool arguments come back as a tool result
+  with `isError: true` (so the model can correct itself); an unknown tool or malformed JSON-RPC is
+  a protocol error.
+- **Responsiveness:** requests are handled in arrival order, so a client may pipeline
+  `handoff_create` -> `handoff_update` -> `handoff_get`. Only long-running work (a synchronous
+  plan/build/audit, or waiting in `tasks/result`) runs on a worker thread, so pings, polling and
+  cancellation are never blocked.
+- **Tasks (experimental in the spec):** `clodex_build` supports task augmentation. Call
+  `tools/call` with a `task` object and it returns a task immediately, backed by a durable worker;
+  then use `tasks/get`, `tasks/result` (blocks until done, returns the tool result), `tasks/list`
+  and `tasks/cancel`. The Clodex `run_id` is the task id. Run statuses map to task statuses:
+  `queued`/`running`/`planning`/`auditing`/`needs-fix` = `working`, `approved`/`applied` =
+  `completed`, `blocked`/`failed` = `failed`, `cancelled` = `cancelled`. Task ids are not
+  access-controlled: this is a local, single-user server, so only expose it to clients you trust.
+  The pre-spec `tasks/update` method is gone.
+- `clodex_audit` accepts `base` (everything since that ref diverged) and `commit` (one commit) as
+  well as the default uncommitted diff.
 
 ## Safety
 

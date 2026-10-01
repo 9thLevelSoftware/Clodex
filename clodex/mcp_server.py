@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import sys
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .config import resolve_repo_root
+from .schemas import validate as validate_schema
 from .tasks import TaskManager
 from .workflow import ClodexWorkflow
 
@@ -21,14 +27,31 @@ TOOLS = [
     {
         "name": "clodex_build",
         "title": "Build with Clodex",
-        "description": "Run Claude planning, Codex implementation, and dual audit.",
-        "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}, "dry_run": {"type": "boolean"}}, "required": ["task"]},
+        "description": "Run Claude planning, Codex implementation, and dual audit. Supports task augmentation: pass `task` in tools/call params to run it as a durable MCP task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "dry_run": {"type": "boolean"},
+                "workspace": {"type": "string", "enum": ["git-worktree", "local"]},
+                "approval_profile": {"type": "string", "enum": ["ci", "local", "auto_review"]},
+            },
+            "required": ["task"],
+        },
+        "execution": {"taskSupport": "optional"},
     },
     {
         "name": "clodex_audit",
         "title": "Audit with Clodex",
-        "description": "Run Claude and Codex adversarial audit over current changes.",
-        "inputSchema": {"type": "object", "properties": {"dry_run": {"type": "boolean"}}},
+        "description": "Run Claude and Codex adversarial audit over current uncommitted changes, everything since a base ref, or one commit.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dry_run": {"type": "boolean"},
+                "base": {"type": "string", "description": "Audit everything since this ref diverged from HEAD"},
+                "commit": {"type": "string", "description": "Audit a single commit"},
+            },
+        },
     },
     {
         "name": "clodex_status",
@@ -128,78 +151,358 @@ HANDOFF_TOOL_NAMES = {
 }
 
 
-def main() -> int:
-    for line in sys.stdin:
-        if not line.strip():
-            continue
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]
+TASKS_MIN_VERSION = "2025-11-25"  # the Tasks utility (experimental) first appears in this revision
+POLL_INTERVAL_MS = 2000
+RELATED_TASK_KEY = "io.modelcontextprotocol/related-task"
+IMMEDIATE_RESPONSE_KEY = "io.modelcontextprotocol/model-immediate-response"
+TASK_PAGE_SIZE = 20
+
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
+METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+
+TOOL_INDEX = {tool["name"]: tool for tool in TOOLS}
+# Tools that run through the durable worker and can therefore be task-augmented.
+TASK_TOOLS = {name for name, tool in TOOL_INDEX.items() if (tool.get("execution") or {}).get("taskSupport") in {"optional", "required"}}
+# Handled by TaskManager alone; everything else needs the workflow/state.
+TASK_MANAGER_TOOLS = {"clodex_task_start", "clodex_task_get", "clodex_task_cancel"}
+
+
+class RpcError(Exception):
+    def __init__(self, code: int, message: str, data: Any = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.data = data
+
+
+class _Aborted(Exception):
+    """The client cancelled the request (or disconnected); send no response."""
+
+
+def error_response(request_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": request_id, "error": error}
+
+
+def task_status(run_status: str) -> str:
+    """Map a Clodex run status onto the MCP task status enum."""
+    if run_status in {"approved", "applied", "completed"}:
+        return "completed"
+    if run_status in {"blocked", "failed"}:
+        return "failed"
+    if run_status == "cancelled":
+        return "cancelled"
+    return "working"
+
+
+def task_object(run: dict[str, Any]) -> dict[str, Any]:
+    status = task_status(str(run.get("status")))
+    message = f"run {run.get('status')}"
+    if status == "failed":
+        message = str(run.get("error") or run.get("blocked_reason") or message)
+    return {
+        "taskId": run["id"],
+        "status": status,
+        "statusMessage": message,
+        "createdAt": run.get("created_at"),
+        "lastUpdatedAt": run.get("updated_at"),
+        "ttl": None,  # runs are kept until deleted, i.e. unlimited
+        "pollInterval": POLL_INTERVAL_MS,
+    }
+
+
+def encode_cursor(offset: int) -> str:
+    return base64.urlsafe_b64encode(f"o:{offset}".encode("ascii")).decode("ascii")
+
+
+def decode_cursor(cursor: Any) -> int:
+    try:
+        text = base64.urlsafe_b64decode(str(cursor).encode("ascii")).decode("ascii")
+        prefix, number = text.split(":", 1)
+        offset = int(number)
+        if prefix != "o" or offset < 0:
+            raise ValueError
+        return offset
+    except (ValueError, UnicodeError):
+        raise RpcError(INVALID_PARAMS, "Invalid cursor") from None
+
+
+def validate_arguments(tool: dict[str, Any], arguments: dict[str, Any]) -> str | None:
+    """A message for the model if the arguments are wrong, else None."""
+    schema = tool["inputSchema"]
+    for key in schema.get("required", []):
+        if key not in arguments or arguments[key] is None:
+            return f"Missing required argument: {key}"
+    if tool["name"] in HANDOFF_TOOL_NAMES:
+        return None  # the handoff tools report their own, more specific, type errors
+    errors = validate_schema(arguments, schema)
+    return "Invalid arguments: " + "; ".join(errors[:5]) if errors else None
+
+
+class McpServer:
+    """Line-delimited JSON-RPC over stdio.
+
+    Requests are handled in order on the reader thread; only long-running work (a synchronous
+    build/plan/audit, or waiting in tasks/result) moves to a worker thread, so it can never
+    stall pings, polling or cancellation.
+    """
+
+    def __init__(self, out: Any = None, workers: int = 8):
+        self.out = out or sys.stdout
+        self.workers = workers
+        self.version = LATEST_PROTOCOL_VERSION
+        self._write_lock = threading.Lock()
+        self._closing = threading.Event()
+        self._inflight: dict[Any, threading.Event] = {}
+        self._inflight_lock = threading.Lock()
+
+    # ------------------------------------------------------------ transport
+
+    def send(self, message: dict[str, Any]) -> None:
+        with self._write_lock:
+            self.out.write(json.dumps(message) + "\n")
+            self.out.flush()
+
+    def serve(self, lines: Any) -> int:
+        with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="clodex-mcp") as pool:
+            for line in lines:
+                if line.strip():
+                    self.dispatch_line(line, pool)
+            self._closing.set()  # client went away: unblock anything waiting on a task
+        return 0
+
+    def dispatch_line(self, line: str, pool: ThreadPoolExecutor) -> None:
         try:
-            request = json.loads(line)
-            response = handle_request(request)
-        except Exception as exc:  # MCP servers must not crash on bad client input.
-            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(exc)}}
-        if response is not None:
-            print(json.dumps(response), flush=True)
-    return 0
+            message = json.loads(line)
+        except ValueError:
+            self.send(error_response(None, PARSE_ERROR, "Parse error"))
+            return
+        if isinstance(message, list):
+            self.send(error_response(None, INVALID_REQUEST, "Batch requests are not supported"))
+            return
+        if not isinstance(message, dict):
+            self.send(error_response(None, INVALID_REQUEST, "Invalid request"))
+            return
+        method = message.get("method")
+        if not isinstance(method, str):
+            if "result" in message or "error" in message:
+                return  # a response to a request of ours; we never send any
+            self.send(error_response(message.get("id"), INVALID_REQUEST, "Invalid request: missing method"))
+            return
+        params = message.get("params")
+        if "id" not in message:
+            self.handle_notification(method, params)  # notifications never get a response
+            return
+        request_id = message["id"]
+        if self.is_blocking(method, params):
+            pool.submit(self.run_request, request_id, method, params)
+        else:
+            # In arrival order, so a client may pipeline create -> update -> get and rely on it.
+            self.run_request(request_id, method, params)
 
+    # Work that can take minutes. Everything else is quick and stays inline.
+    LONG_TOOLS = frozenset({"clodex_plan", "clodex_build", "clodex_audit"})
 
-def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
-    method = request.get("method")
-    request_id = request.get("id")
-    if method == "initialize":
+    def is_blocking(self, method: str, params: Any) -> bool:
+        if method == "tasks/result":
+            return True  # waits for the task to finish
+        if method != "tools/call" or not isinstance(params, dict) or params.get("name") not in self.LONG_TOOLS:
+            return False
+        arguments = params.get("arguments")
+        if isinstance(arguments, dict) and arguments.get("dry_run"):
+            return False
+        # A task-augmented build only starts the worker and returns immediately.
+        return not (isinstance(params.get("task"), dict) and self.tasks_enabled and params.get("name") in TASK_TOOLS)
+
+    def handle_notification(self, method: str, params: Any) -> None:
+        if method == "notifications/cancelled" and isinstance(params, dict):
+            with self._inflight_lock:
+                event = self._inflight.get(params.get("requestId"))
+            if event is not None:
+                event.set()
+
+    def run_request(self, request_id: Any, method: str, params: Any) -> None:
+        cancelled = threading.Event()
+        with self._inflight_lock:
+            self._inflight[request_id] = cancelled
+        try:
+            try:
+                result = self.handle(method, params, cancelled)
+                response: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "result": result}
+            except RpcError as exc:
+                response = error_response(request_id, exc.code, exc.message, exc.data)
+            except _Aborted:
+                return
+            except Exception as exc:  # noqa: BLE001 - a bad request must never take the server down
+                response = error_response(request_id, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
+            if not cancelled.is_set():
+                self.send(response)
+        finally:
+            with self._inflight_lock:
+                self._inflight.pop(request_id, None)
+
+    # ------------------------------------------------------------ methods
+
+    @property
+    def tasks_enabled(self) -> bool:
+        return self.version >= TASKS_MIN_VERSION
+
+    def handle(self, method: str, params: Any, cancelled: threading.Event) -> dict[str, Any]:
+        if params is not None and not isinstance(params, dict):
+            raise RpcError(INVALID_PARAMS, "params must be an object")
+        params = params or {}
+        if method == "initialize":
+            return self.initialize(params)
+        if method == "ping":
+            return {}
+        if method == "tools/list":
+            return {"tools": TOOLS}
+        if method == "tools/call":
+            return self.tools_call(params)
+        if self.tasks_enabled:
+            if method == "tasks/get":
+                return task_object(self.task_run(params))
+            if method == "tasks/result":
+                return self.tasks_result(params, cancelled)
+            if method == "tasks/list":
+                return self.tasks_list(params)
+            if method == "tasks/cancel":
+                return self.tasks_cancel(params)
+        raise RpcError(METHOD_NOT_FOUND, f"Method not found: {method}")
+
+    def initialize(self, params: dict[str, Any]) -> dict[str, Any]:
+        requested = params.get("protocolVersion")
+        if not isinstance(requested, str):
+            raise RpcError(INVALID_PARAMS, "initialize requires a protocolVersion")
+        # Echo the client's version if we speak it, else answer with our newest.
+        self.version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else LATEST_PROTOCOL_VERSION
+        capabilities: dict[str, Any] = {"tools": {"listChanged": False}}
+        if self.tasks_enabled:
+            capabilities["tasks"] = {"list": {}, "cancel": {}, "requests": {"tools": {"call": {}}}}
         return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {"tools": {"listChanged": False}, "tasks": {}},
-                "serverInfo": {"name": "clodex-mcp-server", "version": __version__},
-            },
+            "protocolVersion": self.version,
+            "capabilities": capabilities,
+            "serverInfo": {"name": "clodex-mcp-server", "title": "Clodex", "version": __version__},
         }
-    if method == "notifications/initialized":
-        return None
-    if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}}
-    if method == "tools/call":
-        params = request.get("params") or {}
+
+    # ------------------------------------------------------------ tools
+
+    def tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
         name = params.get("name")
-        arguments = params.get("arguments") or {}
-        return {"jsonrpc": "2.0", "id": request_id, "result": tool_call(name, arguments)}
-    if method == "tasks/get":
-        params = request.get("params") or {}
-        run_id = str(params.get("id") or params.get("taskId") or "")
-        data = TaskManager().get(run_id)
-        if data is None:
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": f"Unknown task: {run_id}"}}
-        return {"jsonrpc": "2.0", "id": request_id, "result": task_result(data)}
-    if method == "tasks/cancel":
-        params = request.get("params") or {}
-        run_id = str(params.get("id") or params.get("taskId") or "")
-        try:
-            result = TaskManager().cancel(run_id)
-        except ValueError as exc:
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": str(exc)}}
-        return {"jsonrpc": "2.0", "id": request_id, "result": task_result({"run": result.__dict__})}
-    if method == "tasks/update":
-        params = request.get("params") or {}
-        run_id = str(params.get("id") or params.get("taskId") or "")
-        data = TaskManager().get(run_id)
-        if data is None:
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": f"Unknown task: {run_id}"}}
-        return {"jsonrpc": "2.0", "id": request_id, "result": task_result(data)}
-    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
+        if not isinstance(name, str):
+            raise RpcError(INVALID_PARAMS, "tools/call requires a tool name")
+        tool = TOOL_INDEX.get(name)
+        if tool is None:
+            raise RpcError(INVALID_PARAMS, f"Unknown tool: {name}")
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return call_text("Arguments must be an object", is_error=True)
+        problem = validate_arguments(tool, arguments)
+        if problem:
+            return call_text(problem, is_error=True)  # tool-level error so the model can correct itself
+        if isinstance(params.get("task"), dict) and self.tasks_enabled:
+            if name not in TASK_TOOLS:
+                raise RpcError(METHOD_NOT_FOUND, f"Tool does not support task augmentation: {name}")
+            return self.create_task(name, arguments)
+        return tool_call(name, arguments)
+
+    def create_task(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if arguments.get("dry_run"):
+            raise RpcError(INVALID_PARAMS, "dry_run is not supported for task-augmented calls")
+        manager = TaskManager(resolve_repo_root())
+        started = manager.start(
+            str(arguments["task"]),
+            workspace_backend=arguments.get("workspace"),
+            approval_profile=arguments.get("approval_profile"),
+        )
+        run = manager.state.get_run(started.run_id)
+        return {
+            "task": task_object(run),
+            "_meta": {IMMEDIATE_RESPONSE_KEY: f"Clodex build started as task {started.run_id}. Poll tasks/get; fetch the outcome with tasks/result."},
+        }
+
+    # ------------------------------------------------------------ tasks
+
+    def task_run(self, params: dict[str, Any]) -> dict[str, Any]:
+        task_id = params.get("taskId", params.get("id"))  # `id` is the pre-spec spelling
+        if not isinstance(task_id, str) or not task_id:
+            raise RpcError(INVALID_PARAMS, "taskId is required")
+        data = TaskManager(resolve_repo_root()).get(task_id)
+        # Only runs started through the worker are tasks (they are the ones with a process).
+        if data is None or not data["run"].get("pid"):
+            raise RpcError(INVALID_PARAMS, "Failed to retrieve task: Task not found")
+        return data["run"]
+
+    def tasks_result(self, params: dict[str, Any], cancelled: threading.Event) -> dict[str, Any]:
+        run = self.task_run(params)
+        manager = TaskManager(resolve_repo_root())
+        while task_status(str(run["status"])) == "working":
+            if cancelled.wait(0.5) or self._closing.is_set():
+                raise _Aborted
+            data = manager.get(str(run["id"]))
+            if data is None:
+                raise RpcError(INVALID_PARAMS, "Failed to retrieve task: Task not found")
+            run = data["run"]
+        summary: dict[str, Any] = {key: run.get(key) for key in ("id", "status", "diff_hash", "error", "blocked_reason", "artifacts_dir", "workspace_path")}
+        agreement = Path(str(run.get("artifacts_dir") or "")) / "05-agreement.json"
+        if agreement.is_file():
+            try:
+                summary["agreement"] = json.loads(agreement.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        result = call_json(summary, is_error=task_status(str(run["status"])) != "completed")
+        result["_meta"] = {RELATED_TASK_KEY: {"taskId": run["id"]}}
+        return result
+
+    def tasks_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        offset = decode_cursor(params["cursor"]) if params.get("cursor") is not None else 0
+        runs = TaskManager(resolve_repo_root()).state.list_runs(limit=TASK_PAGE_SIZE + 1, offset=offset, with_worker=True)
+        page = runs[:TASK_PAGE_SIZE]
+        result: dict[str, Any] = {"tasks": [task_object(run) for run in page]}
+        if len(runs) > TASK_PAGE_SIZE:
+            result["nextCursor"] = encode_cursor(offset + TASK_PAGE_SIZE)
+        return result
+
+    def tasks_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
+        run = self.task_run(params)
+        status = task_status(str(run["status"]))
+        if status != "working":
+            raise RpcError(INVALID_PARAMS, f"Cannot cancel task: already in terminal status '{status}'")
+        manager = TaskManager(resolve_repo_root())
+        manager.cancel(str(run["id"]))
+        return task_object(manager.state.get_run(str(run["id"])) or run)
+
+
+def main() -> int:
+    return McpServer().serve(sys.stdin)
 
 
 def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    if name in HANDOFF_TOOL_NAMES and not isinstance(arguments, dict):
-        return call_text("Arguments must be an object", is_error=True)
-
-    workflow = ClodexWorkflow()
+    root = resolve_repo_root()
+    workflow = None if name in TASK_MANAGER_TOOLS else ClodexWorkflow(root)
     if name == "clodex_plan":
         result = workflow.plan(str(arguments["task"]), dry_run=bool(arguments.get("dry_run", False)))
     elif name == "clodex_build":
-        result = workflow.build(str(arguments["task"]), dry_run=bool(arguments.get("dry_run", False)))
+        result = workflow.build(
+            str(arguments["task"]),
+            dry_run=bool(arguments.get("dry_run", False)),
+            workspace_backend=arguments.get("workspace"),
+            approval_profile=arguments.get("approval_profile"),
+        )
     elif name == "clodex_audit":
-        result = workflow.audit(dry_run=bool(arguments.get("dry_run", False)))
+        try:
+            result = workflow.audit(dry_run=bool(arguments.get("dry_run", False)), base=arguments.get("base"), commit=arguments.get("commit"))
+        except ValueError as exc:  # bad ref etc.: let the model correct itself
+            return call_text(str(exc), is_error=True)
     elif name == "clodex_status":
         data = {"tasks": workflow.state.list_tasks(), "runs": workflow.state.list_runs()}
         return {"content": [{"type": "text", "text": json.dumps(data, indent=2)}], "isError": False}
@@ -210,20 +513,23 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         workflow.state.update_task(str(arguments["id"]), str(arguments["status"]))
         return {"content": [{"type": "text", "text": "task updated"}], "isError": False}
     elif name == "clodex_task_start":
-        result = TaskManager().start(
+        result = TaskManager(root).start(
             str(arguments["task"]),
             workspace_backend=arguments.get("workspace"),
             approval_profile=arguments.get("approval_profile"),
             dry_run=bool(arguments.get("dry_run", False)),
         )
-        return {"content": [{"type": "text", "text": json.dumps(task_result({"run": result.__dict__}), indent=2)}], "isError": False}
+        return {"content": [{"type": "text", "text": json.dumps({"id": result.run_id, "status": result.status, "result": {"run": result.__dict__}}, indent=2)}], "isError": False}
     elif name == "clodex_task_get":
-        data = TaskManager().get(str(arguments["run_id"]))
+        data = TaskManager(root).get(str(arguments["run_id"]))
         if data is None:
             return {"content": [{"type": "text", "text": f"Unknown run: {arguments['run_id']}"}], "isError": True}
         return {"content": [{"type": "text", "text": json.dumps(data, indent=2)}], "isError": False}
     elif name == "clodex_task_cancel":
-        result = TaskManager().cancel(str(arguments["run_id"]))
+        try:
+            result = TaskManager(root).cancel(str(arguments["run_id"]))
+        except ValueError as exc:
+            return call_text(str(exc), is_error=True)
         return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": False}
     elif name == "clodex_handoff_create":
         try:
@@ -388,17 +694,6 @@ def expected_handoff_error(exc: Exception) -> str:
         key = exc.args[0] if exc.args else "argument"
         return f"Missing required argument: {key}"
     return str(exc)
-
-
-def task_result(data: dict[str, Any]) -> dict[str, Any]:
-    run = data.get("run") or {}
-    run_id = run.get("id") or run.get("run_id")
-    status = run.get("status", "unknown")
-    return {
-        "id": run_id,
-        "status": status,
-        "result": data,
-    }
 
 
 if __name__ == "__main__":

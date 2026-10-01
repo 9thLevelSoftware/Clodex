@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .agents import AgentRunner
-from .artifacts import ArtifactStore, current_diff, hash_text, make_run_id, make_task_id
+from .artifacts import ArtifactStore, audit_diff, current_diff, hash_text, make_run_id, make_task_id
 from .commands import claude_audit_command, claude_plan_command, codex_exec_command, codex_review_command
 from .config import ClodexConfig, load_config
 from .jsonutil import AgentEnvelopeError, extract_json_object
@@ -126,11 +126,23 @@ class ClodexWorkflow:
             return WorkflowResult("failed", run_id, str(run["task_id"]), str(artifacts.path), {"error": str(exc)})
         return self._execute_build(str(run["prompt"]), str(run["task_id"]), run_id, artifacts, workspace_backend, approval_profile, apply_changes)
 
-    def audit(self, dry_run: bool = False) -> WorkflowResult:
+    def audit(self, dry_run: bool = False, base: str | None = None, commit: str | None = None) -> WorkflowResult:
+        """Audit the uncommitted diff, everything since `base`, or a single `commit`."""
         if dry_run:
             return WorkflowResult("dry-run", None, None, None, {"commands": self.dry_run_commands()})
         ensure_usable(self.config)
-        task = "Audit current uncommitted changes"
+
+        def diff_fn() -> str:
+            return audit_diff(self.repo_root, base=base, commit=commit)
+
+        if not diff_fn().strip():
+            return WorkflowResult("nothing-to-audit", None, None, None, {"message": "There are no changes to audit."})
+        if commit:
+            task = f"Audit commit {commit}"
+        elif base:
+            task = f"Audit changes since {base}"
+        else:
+            task = "Audit current uncommitted changes"
         task_id = make_task_id(task)
         run_id = make_run_id(task_id)
         artifacts = ArtifactStore(self.config, run_id, self.state)
@@ -144,7 +156,10 @@ class ClodexWorkflow:
             task_id,
             artifacts,
             trace,
-            lambda: self._audit_loop(task_id, run_id, artifacts, plan_json, AgentRunner(self.repo_root), self.repo_root, trace, None),
+            lambda: self._audit_loop(
+                task_id, run_id, artifacts, plan_json, AgentRunner(self.repo_root), self.repo_root, trace, None,
+                diff_fn=diff_fn, allow_fixes=commit is None,  # a historical commit cannot be fixed in place
+            ),
         )
 
     def apply_run(self, run_id: str | None, check: bool = False, force: bool = False) -> WorkflowResult:
@@ -269,6 +284,8 @@ class ClodexWorkflow:
         trace: TraceWriter,
         approval_profile: str | None,
         include_untracked: bool = False,
+        diff_fn: Callable[[], str] | None = None,
+        allow_fixes: bool = True,
     ) -> WorkflowResult:
         agreement: dict[str, Any] = {}
         block_error: str | None = None
@@ -276,7 +293,7 @@ class ClodexWorkflow:
         for attempt in range(self.config.max_fix_loops + 1):
             if include_untracked:
                 self._include_untracked(diff_root)
-            diff = current_diff(diff_root)
+            diff = diff_fn() if diff_fn else current_diff(diff_root)
             diff_hash = hash_text(diff)
             artifacts.write_text("changes.diff", diff, exact=True)
             verdicts = self._run_reviewers(artifacts, plan_json, diff, diff_hash, runner, trace, attempt)
@@ -293,7 +310,7 @@ class ClodexWorkflow:
                 # A reviewer that could not run is an infrastructure problem, not something Codex can fix.
                 block_error = "Required reviewer failed: " + "; ".join(f"{v['reviewer_id']}: {v['_error']}" for v in failed)
                 break
-            if attempt >= self.config.max_fix_loops:
+            if attempt >= self.config.max_fix_loops or not allow_fixes:
                 break
             findings = self._required_fixes(*verdicts, diff_hash=diff_hash)
             fix = runner.run(codex_exec_command(self.config, diff_root, approval_profile=approval_profile), fix_prompt(plan_json, findings))

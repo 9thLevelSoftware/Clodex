@@ -54,7 +54,7 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("clodex_handoff_decide", names)
 
     def test_mcp_tasks_get_unknown_run(self):
-        request = {"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "missing"}}
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"taskId": "missing"}}
         result = subprocess.run(
             [sys.executable, "-m", "clodex", "mcp-server"],
             input=json.dumps(request) + "\n",
@@ -67,7 +67,7 @@ class McpServerTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         response = json.loads(result.stdout.splitlines()[0])
-        self.assertEqual(response["error"]["code"], -32004)
+        self.assertEqual(response["error"]["code"], -32602)  # spec: invalid or unknown taskId
 
     def test_mcp_handoff_create_update_get_and_decide(self):
         with tempfile.TemporaryDirectory() as tmp:

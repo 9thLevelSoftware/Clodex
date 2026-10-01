@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -151,6 +152,12 @@ class ClodexConfig:
     @property
     def tracing(self) -> dict[str, Any]:
         return dict(DEFAULT_CONFIG["tracing"] | self.raw.get("tracing", {}))
+
+
+def resolve_repo_root() -> Path:
+    """The repo Clodex should work on: $CLODEX_REPO_ROOT if set (MCP clients start servers from anywhere), else the git root above the cwd."""
+    override = os.environ.get("CLODEX_REPO_ROOT")
+    return find_repo_root(Path(override)) if override else find_repo_root()
 
 
 def find_repo_root(start: Path | None = None) -> Path:

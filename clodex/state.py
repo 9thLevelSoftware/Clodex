@@ -568,6 +568,9 @@ class StateStore:
         with self.session() as con:
             return [dict(row) for row in con.execute("select * from tasks order by updated_at desc")]
 
-    def list_runs(self) -> list[dict[str, Any]]:
+    def list_runs(self, limit: int = 20, offset: int = 0, with_worker: bool = False) -> list[dict[str, Any]]:
+        """Newest first. `with_worker` keeps only runs started through a worker process (the MCP "tasks")."""
+        where = "where pid is not null" if with_worker else ""
         with self.session() as con:
-            return [dict(row) for row in con.execute("select * from runs order by updated_at desc limit 20")]
+            rows = con.execute(f"select * from runs {where} order by updated_at desc, id desc limit ? offset ?", (limit, offset))
+            return [dict(row) for row in rows]

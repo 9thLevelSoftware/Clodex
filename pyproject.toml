@@ -11,6 +11,10 @@ requires-python = ">=3.12"
 dependencies = ["pyyaml>=6"]
 classifiers = ["License :: Other/Proprietary License"]
 
+[project.optional-dependencies]
+# The official MCP SDK: enables tests that validate wire messages against its schema models.
+test = ["mcp>=2"]
+
 [project.scripts]
 clodex = "clodex.cli:main"
 clodex-mcp-server = "clodex.mcp_server:main"

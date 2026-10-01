@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
-from .config import ConfigError
+from .config import ConfigError, resolve_repo_root
 from .doctor import run_doctor
 from .evals import run_local_evals
 from .hooks import hook_config, ingest_hook_event
@@ -27,13 +28,16 @@ from .workflow import ClodexWorkflow
 def main(argv: list[str] | None = None) -> int:
     try:
         return _main(argv)
-    except (ConfigError, ModelRetiredError) as exc:
+    except (ConfigError, ModelRetiredError, ValueError) as exc:
+        if os.environ.get("CLODEX_DEBUG"):
+            raise
+        # Deliberate user-facing errors (unknown run id, bad ref, bad config): one line, no traceback.
         print(f"clodex: error: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
 
 
 def handle_migrate(args: argparse.Namespace) -> int:
-    contract = Path.cwd() / "CLODEX.md"
+    contract = resolve_repo_root() / "CLODEX.md"
     if not contract.is_file():
         print_output({"ok": False, "error": f"{contract} not found"}, args.json)
         return 1
@@ -82,9 +86,12 @@ def _main(argv: list[str] | None = None) -> int:
     build = sub.add_parser("build", help="Run plan, implementation, and dual audit")
     add_build_args(build)
 
-    audit = sub.add_parser("audit", help="Audit current uncommitted changes")
+    audit = sub.add_parser("audit", help="Audit current uncommitted changes, everything since a base ref, or one commit")
     audit.add_argument("--dry-run", action="store_true")
-    audit.add_argument("--diff", action="store_true", help="Accepted for compatibility; audit always uses git diff")
+    audit_target = audit.add_mutually_exclusive_group()
+    audit_target.add_argument("--diff", action="store_true", help="Audit the current uncommitted diff (the default)")
+    audit_target.add_argument("--base", metavar="REF", help="Audit everything since this ref diverged from HEAD, including uncommitted edits")
+    audit_target.add_argument("--commit", metavar="SHA", help="Audit the changes introduced by one commit")
 
     run = sub.add_parser("run", help="Alias for build")
     add_build_args(run)
@@ -150,7 +157,7 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "mcp-server":
         return mcp_main()
     if args.command == "doctor":
-        exit_code, data = run_doctor(strict=args.strict)
+        exit_code, data = run_doctor(resolve_repo_root(), strict=args.strict)
         print_output(data, args.json)
         return exit_code
     if args.command == "init" and args.migrate:
@@ -200,12 +207,13 @@ def _main(argv: list[str] | None = None) -> int:
             print_output(data, args.json)
             return exit_code
 
-    workflow = ClodexWorkflow(Path.cwd())
+    repo = resolve_repo_root()
+    workflow = ClodexWorkflow(repo)
 
     if args.command == "plan":
         result = workflow.plan(" ".join(args.task), dry_run=args.dry_run)
         print_result(result.__dict__, args.json)
-        return 0
+        return exit_code_for(result.status)
     if args.command in {"build", "run"}:
         result = workflow.build(
             " ".join(args.task),
@@ -215,25 +223,25 @@ def _main(argv: list[str] | None = None) -> int:
             apply_changes=args.apply_changes,
         )
         print_result(result.__dict__, args.json)
-        return 0 if result.status not in {"blocked"} else 1
+        return exit_code_for(result.status)
     if args.command == "audit":
-        result = workflow.audit(dry_run=args.dry_run)
+        result = workflow.audit(dry_run=args.dry_run, base=args.base, commit=args.commit)
         print_result(result.__dict__, args.json)
-        return 0 if result.status not in {"blocked"} else 1
+        return exit_code_for(result.status)
     if args.command == "task":
         return handle_task(args, workflow, args.json)
     if args.command == "apply":
         result = workflow.apply_run(args.run_id, check=args.check, force=args.force)
         print_result(result.__dict__, args.json)
-        return 0 if result.status not in {"apply-failed", "apply-check-failed", "apply-refused"} else 1
+        return exit_code_for(result.status)
     if args.command == "clean":
         result = workflow.clean_run(args.run_id)
         print_result(result.__dict__, args.json)
-        return 0 if result.status != "clean-refused" else 1
+        return exit_code_for(result.status)
     if args.command == "trace":
         return handle_trace(args, workflow, args.json)
     if args.command == "eval":
-        data = run_local_evals(Path.cwd())
+        data = run_local_evals(repo)
         print_output(data, args.json)
         return 0 if data["passed"] else 1
     if args.command == "hooks":
@@ -266,7 +274,7 @@ def add_build_args(parser: argparse.ArgumentParser) -> None:
 
 
 def handle_task(args: argparse.Namespace, workflow: ClodexWorkflow, as_json: bool) -> int:
-    manager = TaskManager(Path.cwd())
+    manager = TaskManager(resolve_repo_root())
     if args.task_command == "start":
         result = manager.start(" ".join(args.task), workspace_backend=args.workspace, approval_profile=args.approval_profile, dry_run=args.dry_run)
         print_result(result.__dict__, as_json)
@@ -289,7 +297,7 @@ def handle_task(args: argparse.Namespace, workflow: ClodexWorkflow, as_json: boo
         with Heartbeat(workflow.state, args.run_id):
             result = workflow.run_existing(args.run_id, workspace_backend=args.workspace, approval_profile=args.approval_profile)
         print_result(result.__dict__, as_json)
-        return 0 if result.status not in {"blocked"} else 1
+        return exit_code_for(result.status)
     return 2
 
 
@@ -308,16 +316,35 @@ def handle_trace(args: argparse.Namespace, workflow: ClodexWorkflow, as_json: bo
 
 def handle_hooks(args: argparse.Namespace, as_json: bool) -> int:
     if args.hooks_command == "print":
-        print_output(hook_config(Path.cwd()), as_json)
+        print_output(hook_config(resolve_repo_root()), as_json)
         return 0
     if args.hooks_command == "install":
-        print_output({"dry_run": True, "config": hook_config(Path.cwd())}, as_json)
+        print_output({"dry_run": True, "config": hook_config(resolve_repo_root())}, as_json)
         return 0
     if args.hooks_command == "ingest":
         payload = json.loads(sys.stdin.read() or "{}")
-        print_output(ingest_hook_event(Path.cwd(), args.run_id, payload), as_json)
+        print_output(ingest_hook_event(resolve_repo_root(), args.run_id, payload), as_json)
         return 0
     return 2
+
+
+# Exit codes: 0 success, 1 the work was refused or rejected (blocked, nothing applied),
+# 2 usage or configuration error, 3 failed unexpectedly, 4 cancelled.
+EXIT_BLOCKED = 1
+EXIT_USAGE = 2
+EXIT_FAILED = 3
+EXIT_CANCELLED = 4
+_BLOCKED_STATUSES = {"blocked", "apply-refused", "apply-failed", "apply-check-failed", "clean-refused"}
+
+
+def exit_code_for(status: str) -> int:
+    if status in _BLOCKED_STATUSES:
+        return EXIT_BLOCKED
+    if status == "failed":
+        return EXIT_FAILED
+    if status == "cancelled":
+        return EXIT_CANCELLED
+    return 0
 
 
 def print_result(data: dict[str, Any], as_json: bool) -> None:
@@ -338,5 +365,59 @@ def print_result(data: dict[str, Any], as_json: bool) -> None:
 def print_output(data: dict[str, Any], as_json: bool) -> None:
     if as_json:
         print(json.dumps(data, indent=2, sort_keys=True))
+    elif "diagnostics" in data and "python" in data:
+        print("\n".join(format_doctor(data)))
     else:
-        print(json.dumps(data, indent=2, sort_keys=True))
+        print("\n".join(format_human(data)) or "(nothing to show)")
+
+
+def _scalar(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def format_human(data: Any, indent: int = 0) -> list[str]:
+    """Plain-text rendering of nested dicts/lists for people (machine consumers use --json)."""
+    pad = "  " * indent
+    lines: list[str] = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, (dict, list)) and value:
+                lines.append(f"{pad}{key}:")
+                lines.extend(format_human(value, indent + 1))
+            else:
+                lines.append(f"{pad}{key}: {_scalar(value) if not isinstance(value, (dict, list)) else '(none)'}")
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                head = next((str(item[key]) for key in ("id", "name", "run_id", "taskId") if key in item), "")
+                lines.append(f"{pad}- {head}".rstrip())
+                lines.extend(format_human({k: v for k, v in item.items() if str(v) != head}, indent + 1))
+            else:
+                lines.append(f"{pad}- {_scalar(item)}")
+    else:
+        lines.append(f"{pad}{_scalar(data)}")
+    return lines
+
+
+def format_doctor(data: dict[str, Any]) -> list[str]:
+    def mark(ok: bool) -> str:
+        return "[ok]  " if ok else "[FAIL]"
+
+    lines = [f"{mark(data['python']['ok'])} python {data['python']['version']}", f"{mark(data['contract']['ok'])} CLODEX.md ({data['contract']['path']})"]
+    for name in ("git", "claude", "codex"):
+        info = data[name]
+        lines.append(f"{mark(info['ok'])} {name}: {info.get('version') or 'not found'}")
+    for name, auth in (data.get("auth") or {}).items():
+        lines.append(f"{mark(auth['status'] != 'logged-out')} {name} login: {auth['status']}")
+    for item in data["diagnostics"]:
+        tag = "[FAIL]" if item["level"] == "error" else "[warn]"
+        lines.append(f"{tag} {item['where']}: {item['message']}")
+        if item.get("fix"):
+            lines.append(f"       fix: {item['fix']}")
+    lines.append("")
+    lines.append("Everything looks good." if data["ok"] else "Problems found; see above.")
+    return lines

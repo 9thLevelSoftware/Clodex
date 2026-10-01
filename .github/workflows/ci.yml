@@ -30,6 +30,8 @@ jobs:
         run: |
           git config --global user.email "ci@example.com"
           git config --global user.name "CI"
+      - name: Install the MCP SDK (enables wire-schema tests; they skip if unavailable)
+        run: python -m pip install mcp || echo "mcp SDK unavailable on this Python; wire-schema tests will skip"
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: package.json is valid JSON
