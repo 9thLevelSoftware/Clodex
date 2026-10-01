@@ -28,37 +28,43 @@ def make_run_id(task_id: str) -> str:
 
 
 class ArtifactStore:
-    def __init__(self, config: ClodexConfig, run_id: str):
+    def __init__(self, config: ClodexConfig, run_id: str, state: Any = None):
         self.config = config
         self.run_id = run_id
+        self.state = state
         self.path = config.runs_root / run_id
         self.path.mkdir(parents=True, exist_ok=True)
+
+    def _record(self, name: str, path: Path) -> None:
+        """Index the file in the state ledger so `handoff_get` and exports can find it."""
+        if self.state is not None:
+            self.state.add_artifact(self.run_id, name, str(path), path.suffix.lstrip(".") or "file")
 
     def write_json(self, name: str, data: dict[str, Any]) -> Path:
         path = self.path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._record(name, path)
         return path
 
-    def write_text(self, name: str, text: str) -> Path:
+    def write_text(self, name: str, text: str, exact: bool = False) -> Path:
+        """Write text; `exact=True` keeps bytes as-is (no newline translation), for diffs and patches."""
         path = self.path / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        if exact:
+            path.write_bytes(text.encode("utf-8", errors="surrogateescape"))
+        else:
+            path.write_text(text, encoding="utf-8")
+        self._record(name, path)
         return path
 
 
 def current_diff(repo_root: Path) -> str:
-    result = subprocess.run(
-        ["git", "diff", "--binary", "HEAD"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    return result.stdout
+    # Read bytes, not text: universal-newline decoding would rewrite CRLF content and
+    # the diff would no longer apply to (or hash like) the real files.
+    result = subprocess.run(["git", "diff", "--binary", "HEAD"], cwd=repo_root, capture_output=True, check=False)
+    return result.stdout.decode("utf-8", errors="surrogateescape")
 
 
 def hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text.encode("utf-8", errors="surrogateescape")).hexdigest()

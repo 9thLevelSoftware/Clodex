@@ -4,9 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clodex"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Local Claude Code CLI and Codex CLI workflow orchestration"
+readme = "README.md"
 requires-python = ">=3.12"
+dependencies = ["pyyaml>=6"]
+classifiers = ["License :: Other/Proprietary License"]
 
 [project.scripts]
 clodex = "clodex.cli:main"
+clodex-mcp-server = "clodex.mcp_server:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "clodex.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["clodex*"]
+# pip installs depend on the real PyYAML; the vendored copy is for npm installs only.
+exclude = ["clodex._vendor*"]
+
+[tool.setuptools.package-data]
+clodex = ["schemas/*.json"]

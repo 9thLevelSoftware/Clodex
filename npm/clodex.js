@@ -13,8 +13,8 @@ function candidates() {
   values.push({ cmd: "python3", prefix: [] });
   values.push({ cmd: "python", prefix: [] });
   if (process.platform === "win32") {
-    values.push({ cmd: "py", prefix: ["-3.13"] });
-    values.push({ cmd: "py", prefix: ["-3.12"] });
+    values.push({ cmd: "py", prefix: ["-3"] });
+    for (const minor of ["3.14", "3.13", "3.12"]) values.push({ cmd: "py", prefix: ["-" + minor] });
   }
   return values;
 }

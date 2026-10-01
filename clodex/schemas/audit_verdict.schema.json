@@ -1,0 +1,28 @@
+{
+  "title": "Clodex audit verdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["approved", "diff_hash", "reviewer_id", "persona", "summary", "findings", "required_fixes"],
+  "properties": {
+    "approved": {"type": "boolean"},
+    "diff_hash": {"type": "string"},
+    "reviewer_id": {"type": "string"},
+    "persona": {"type": "string"},
+    "summary": {"type": "string"},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "file", "line", "message"],
+        "properties": {
+          "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
+          "file": {"type": ["string", "null"]},
+          "line": {"type": ["integer", "null"]},
+          "message": {"type": "string"}
+        }
+      }
+    },
+    "required_fixes": {"type": "array", "items": {"type": "string"}}
+  }
+}

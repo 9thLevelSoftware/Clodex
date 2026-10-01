@@ -5,6 +5,10 @@ import re
 from typing import Any
 
 
+class AgentEnvelopeError(ValueError):
+    """The agent CLI reported an error inside its JSON result envelope."""
+
+
 def extract_json_object(text: str) -> dict[str, Any]:
     stripped = text.strip()
     if not stripped:
@@ -30,6 +34,8 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 def normalize_json_value(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
+        if value.get("type") == "result":
+            return unwrap_claude_envelope(value)
         if "result" in value and isinstance(value["result"], dict):
             return value["result"]
         if "content" in value and isinstance(value["content"], str):
@@ -38,3 +44,18 @@ def normalize_json_value(value: Any) -> dict[str, Any]:
             return extract_json_object(value["message"])
         return value
     raise ValueError("model output was not a JSON object")
+
+
+def unwrap_claude_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap the `claude -p --output-format json` result envelope."""
+    if envelope.get("is_error"):
+        raise AgentEnvelopeError(f"agent returned an error result: {envelope.get('result')}")
+    structured = envelope.get("structured_output")
+    if isinstance(structured, dict):
+        return structured
+    result = envelope.get("result")
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        return extract_json_object(result)
+    raise ValueError("agent result envelope had no usable result")

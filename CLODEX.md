@@ -9,11 +9,15 @@ workspace:
   backend: git-worktree
   apply_mode: manual
 claude:
-  model: opus
-  effort: max
   permission_mode: plan
+  plan:
+    model: opus
+    effort: max
+  audit:
+    model: opus
+    effort: high
 codex:
-  model: gpt-5.5
+  model: gpt-6.1-sol
   reasoning_effort: xhigh
   sandbox: workspace-write
   approval_profile: ci

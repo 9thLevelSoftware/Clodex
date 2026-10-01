@@ -4,8 +4,8 @@ Clodex is a native collaboration layer for **Claude Code CLI** and **Codex CLI**
 It installs repo instructions and MCP tools that let either agent hand work to
 the other without the user manually driving every step.
 
-- **Claude Code** plans first with Opus at max effort.
-- **Codex** implements from that accepted plan with GPT-5.5 at xhigh reasoning.
+- **Claude Code** plans first with Opus at max effort and audits at high effort.
+- **Codex** implements from that accepted plan with GPT-6.1 Sol at xhigh reasoning.
 - **Both agents audit the same final diff hash** and must agree before the task
   is considered complete.
 
@@ -116,7 +116,8 @@ PowerShell:
 | `clodex build "<task>"` | Run plan, implementation, and dual audit loop in an isolated worktree |
 | `clodex audit --diff` | Audit current uncommitted changes |
 | `clodex run "<task>"` | Alias for `build` |
-| `clodex apply <run-id>` | Apply an approved worktree patch back to the source checkout |
+| `clodex apply <run-id>` | Apply an approved worktree patch back to the source checkout (`--check` to dry-run, `--force` for unapproved runs) |
+| `clodex clean <run-id>` | Remove the kept git worktree of a finished run (artifacts and patch stay) |
 | `clodex task start/get/cancel/list` | Manage durable async runs |
 | `clodex trace export <run-id>` | Print a run trace as JSONL |
 | `clodex hooks print/install/ingest` | Generate or ingest Claude Code hook events |
@@ -132,11 +133,15 @@ prompt body. Defaults:
 
 ```yaml
 claude:
-  model: opus
-  effort: max
   permission_mode: plan
+  plan:
+    model: opus
+    effort: max
+  audit:
+    model: opus
+    effort: high
 codex:
-  model: gpt-5.5
+  model: gpt-6.1-sol
   reasoning_effort: xhigh
   sandbox: workspace-write
   approval_profile: ci
@@ -164,6 +169,26 @@ Local task/run state is stored in `.clodex/state.sqlite3`.
 By default, `clodex build` executes inside `.clodex/workspaces/<run-id>/`.
 The source checkout is not modified until `clodex apply <run-id>` succeeds.
 Use `--workspace local` for compatibility with the earlier in-place behavior.
+
+`clodex apply` only applies **approved** runs, and only if `apply.patch` still matches the
+approved diff hash; a local-workspace run is reported as already in the working tree. A run
+that fails unexpectedly is marked `failed` (traceback in `error.txt`) and its worktree is
+removed; approved and blocked runs keep theirs until `clodex clean <run-id>`.
+
+### Audit quorum
+
+`audit.quorum` decides when the reviewers agree: `unanimous` (default), `majority`, or a number
+N. Only reviewers with `required: true` count; optional reviewers are recorded but never block.
+A reviewer that fails or times out counts as not approved. If a *required* reviewer cannot run,
+the run is `blocked` with that error rather than sent back to Codex for a fix. Very large diffs
+are truncated in the audit prompt (`audit.max_diff_bytes`, default 200000); the diff hash still
+covers the whole diff.
+
+### Async tasks
+
+`clodex task start` runs the build in a detached worker. `task cancel` stops the worker and any
+agent it started, and removes the run's worktree. Workers write a heartbeat; `task get/list`
+mark a run `failed` if its worker died without finishing.
 
 ## MCP Tools
 

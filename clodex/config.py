@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-import json
+import sys
+from datetime import date
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+try:
+    import yaml
+except ImportError:  # npm installs have no site-packages PyYAML; use the vendored copy
+    from ._vendor import yaml
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -18,18 +24,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "apply_mode": "manual",
     },
     "claude": {
-        "model": "opus",
-        "effort": "max",
         "permission_mode": "plan",
+        # Planning gets the most reasoning; audits run often, so they default lower.
+        "plan": {"model": "opus", "effort": "max"},
+        "audit": {"model": "opus", "effort": "high"},
     },
     "codex": {
-        "model": "gpt-5.5",
+        "model": "gpt-6.1-sol",
         "reasoning_effort": "xhigh",
         "sandbox": "workspace-write",
         "approval_profile": "ci",
     },
     "audit": {
         "quorum": "unanimous",
+        "max_diff_bytes": 200000,
         "personas": ["security", "performance", "portability", "test-gap"],
         "reviewers": [
             {"id": "claude-plan", "backend": "claude", "persona": "plan-adherence", "required": True, "timeout": 600},
@@ -49,11 +57,43 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+ROLES = ("plan", "audit")
+
+
+class ConfigError(ValueError):
+    """CLODEX.md could not be loaded."""
+
+
+# Codex models being retired: model -> (retire date, successor). A fuller
+# registry replaces this once model validation lands.
+RETIRING_CODEX_MODELS: dict[str, tuple[str, str]] = {
+    "gpt-5.5": ("2026-10-14", "gpt-6.1-sol"),
+}
+_warned_models: set[str] = set()
+
+
+def warn_if_model_retiring(model: str) -> None:
+    entry = RETIRING_CODEX_MODELS.get(model)
+    if entry is None or model in _warned_models:
+        return
+    _warned_models.add(model)
+    retire_on, successor = entry
+    verb = "has retired" if date.today() >= date.fromisoformat(retire_on) else "retires"
+    print(
+        f"clodex: warning: Codex model '{model}' {verb} on {retire_on}. "
+        f"Set `model: {successor}` under `codex:` in the CLODEX.md front matter.",
+        file=sys.stderr,
+    )
+
+
 @dataclass(frozen=True)
 class ClodexConfig:
     repo_root: Path
     raw: dict[str, Any] = field(default_factory=dict)
     prompt_body: str = ""
+    # Only what CLODEX.md set explicitly (no defaults), so legacy flat keys can
+    # outrank the per-role defaults.
+    user: dict[str, Any] = field(default_factory=dict)
 
     @property
     def max_fix_loops(self) -> int:
@@ -79,9 +119,29 @@ class ClodexConfig:
     def claude(self) -> dict[str, Any]:
         return dict(DEFAULT_CONFIG["claude"] | self.raw.get("claude", {}))
 
+    def claude_role(self, role: str) -> dict[str, Any]:
+        """Effective Claude settings for `plan` or `audit`.
+
+        Precedence, lowest to highest: built-in role defaults, flat `claude.*` keys in
+        CLODEX.md (the pre-0.2 layout, which drove both roles), then `claude.<role>.*`.
+        """
+        defaults = DEFAULT_CONFIG["claude"]
+        user = self.user.get("claude")
+        user = user if isinstance(user, dict) else {}
+        flat = {key: value for key, value in user.items() if key not in ROLES}
+        explicit = user.get(role)
+        explicit = explicit if isinstance(explicit, dict) else {}
+        return {"permission_mode": defaults["permission_mode"], **defaults[role], **flat, **explicit}
+
     @property
     def codex(self) -> dict[str, Any]:
         return dict(DEFAULT_CONFIG["codex"] | self.raw.get("codex", {}))
+
+    def codex_role(self, role: str) -> dict[str, Any]:
+        """Codex settings for a role; `codex.audit.*` overrides model/effort for audits."""
+        base = {key: value for key, value in self.codex.items() if key not in ROLES}
+        override = self.codex.get(role)
+        return {**base, **(override if isinstance(override, dict) else {})}
 
     @property
     def audit(self) -> dict[str, Any]:
@@ -117,67 +177,37 @@ def load_config(repo_root: Path | None = None) -> ClodexConfig:
 
     text = contract.read_text(encoding="utf-8")
     front_matter, body = split_front_matter(text)
-    parsed = parse_minimal_yaml(front_matter)
+    parsed = parse_front_matter(front_matter, str(contract))
     merged = deep_merge(DEFAULT_CONFIG, parsed)
-    return ClodexConfig(repo_root=root, raw=merged, prompt_body=body.strip())
+    warn_if_model_retiring(str(merged["codex"].get("model", "")))
+    return ClodexConfig(repo_root=root, raw=merged, prompt_body=body.strip(), user=parsed)
 
 
 def split_front_matter(text: str) -> tuple[str, str]:
-    if not text.startswith("---"):
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
         return "", text
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return "", text
-    return parts[1], parts[2]
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            return "".join(lines[1:index]), "".join(lines[index + 1 :])
+    return "", text
 
 
-def parse_minimal_yaml(text: str) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    current_section: str | None = None
-    for raw_line in text.splitlines():
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        indent = len(raw_line) - len(raw_line.lstrip(" "))
-        line = raw_line.strip()
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if indent == 0 and value == "":
-            result[key] = {}
-            current_section = key
-            continue
-        target = result
-        if indent > 0 and current_section:
-            section = result.setdefault(current_section, {})
-            if isinstance(section, dict):
-                target = section
-        target[key] = parse_scalar(value)
-    return result
+def parse_front_matter(text: str, source: str = "CLODEX.md") -> dict[str, Any]:
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Invalid YAML front matter in {source}: {exc}") from exc
+    if parsed is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise ConfigError(f"{source} front matter must be a mapping, got {type(parsed).__name__}")
+    return _drop_nulls(parsed)
 
 
-def parse_scalar(value: str) -> Any:
-    if value == "":
-        return ""
-    if value.startswith(("[", "{")) and value.endswith(("]", "}")):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            pass
-    lowered = value.lower()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    if value.isdigit():
-        return int(value)
-    if value.startswith("[") and value.endswith("]"):
-        inner = value[1:-1].strip()
-        if not inner:
-            return []
-        return [item.strip().strip("\"'") for item in inner.split(",")]
-    return value.strip("\"'")
+def _drop_nulls(value: dict[str, Any]) -> dict[str, Any]:
+    """Treat `key:` with no value as unset so it cannot wipe out a default section."""
+    return {key: _drop_nulls(item) if isinstance(item, dict) else item for key, item in value.items() if item is not None}
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

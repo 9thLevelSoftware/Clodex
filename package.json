@@ -1,6 +1,6 @@
 {
   "name": "clodex",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Native Claude Code and Codex collaboration for local-first agent workflows",
   "license": "UNLICENSED",
   "repository": {
@@ -10,7 +10,7 @@
   "homepage": "https://github.com/9thLevelSoftware/Clodex#readme",
   "bugs": {
     "url": "https://github.com/9thLevelSoftware/Clodex/issues"
-  }
+  },
   "type": "commonjs",
   "keywords": [
     "claude-code",
@@ -25,7 +25,10 @@
     "clodex-mcp-server": "npm/clodex-mcp-server.js"
   },
   "files": [
-    "clodex/*.py",
+    "clodex/**/*.py",
+    "clodex/schemas/*.json",
+    "clodex/_vendor/VENDORED.md",
+    "clodex/_vendor/yaml/LICENSE",
     "npm/*.js",
     "bin/clodex",
     "mcp-bridge/bin/clodex-mcp-server",

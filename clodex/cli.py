@@ -17,7 +17,7 @@ from .native import (
     native_status,
     plan_native_install,
 )
-from .tasks import TaskManager
+from .tasks import Heartbeat, TaskManager
 from .workflow import ClodexWorkflow
 
 
@@ -89,6 +89,10 @@ def main(argv: list[str] | None = None) -> int:
     apply_cmd = sub.add_parser("apply", help="Apply an approved worktree run patch")
     apply_cmd.add_argument("run_id")
     apply_cmd.add_argument("--check", action="store_true")
+    apply_cmd.add_argument("--force", action="store_true", help="Apply even if the run is not approved or its patch changed")
+
+    clean_cmd = sub.add_parser("clean", help="Remove the kept git worktree of a finished run")
+    clean_cmd.add_argument("run_id")
 
     trace = sub.add_parser("trace", help="Inspect run traces")
     trace_sub = trace.add_subparsers(dest="trace_command", required=True)
@@ -187,9 +191,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "task":
         return handle_task(args, workflow, args.json)
     if args.command == "apply":
-        result = workflow.apply_run(args.run_id, check=args.check)
+        result = workflow.apply_run(args.run_id, check=args.check, force=args.force)
         print_result(result.__dict__, args.json)
-        return 0 if result.status not in {"apply-failed", "apply-check-failed"} else 1
+        return 0 if result.status not in {"apply-failed", "apply-check-failed", "apply-refused"} else 1
+    if args.command == "clean":
+        result = workflow.clean_run(args.run_id)
+        print_result(result.__dict__, args.json)
+        return 0 if result.status != "clean-refused" else 1
     if args.command == "trace":
         return handle_trace(args, workflow, args.json)
     if args.command == "eval":
@@ -246,7 +254,8 @@ def handle_task(args: argparse.Namespace, workflow: ClodexWorkflow, as_json: boo
         print_output(manager.list(), as_json)
         return 0
     if args.task_command == "worker":
-        result = workflow.run_existing(args.run_id, workspace_backend=args.workspace, approval_profile=args.approval_profile)
+        with Heartbeat(workflow.state, args.run_id):
+            result = workflow.run_existing(args.run_id, workspace_backend=args.workspace, approval_profile=args.approval_profile)
         print_result(result.__dict__, as_json)
         return 0 if result.status not in {"blocked"} else 1
     return 2

@@ -6,6 +6,7 @@ import sys
 import uuid
 from typing import Any
 
+from . import __version__
 from .tasks import TaskManager
 from .workflow import ClodexWorkflow
 
@@ -151,7 +152,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": "2025-11-25",
                 "capabilities": {"tools": {"listChanged": False}, "tasks": {}},
-                "serverInfo": {"name": "clodex-mcp-server", "version": "0.1.0"},
+                "serverInfo": {"name": "clodex-mcp-server", "version": __version__},
             },
         }
     if method == "notifications/initialized":
