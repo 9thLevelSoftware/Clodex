@@ -151,7 +151,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": "2025-11-25",
                 "capabilities": {"tools": {"listChanged": False}, "tasks": {}},
-                "serverInfo": {"name": "clodex-mcp-server", "version": "0.1.0"},
+                "serverInfo": {"name": "clodex-mcp-server", "version": "0.1.1"},
             },
         }
     if method == "notifications/initialized":

@@ -13,7 +13,7 @@ claude:
   effort: max
   permission_mode: plan
 codex:
-  model: gpt-5.5
+  model: gpt-6.1-sol
   reasoning_effort: xhigh
   sandbox: workspace-write
   approval_profile: ci

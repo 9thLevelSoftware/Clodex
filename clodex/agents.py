@@ -14,6 +14,7 @@ class AgentResult:
     stdout: str
     stderr: str
     returncode: int
+    timed_out: bool = False
 
     @property
     def ok(self) -> bool:
@@ -29,20 +30,37 @@ class AgentRunner:
         resolved = shutil.which(argv[0])
         if resolved:
             argv[0] = resolved
-        result = subprocess.run(
-            argv,
-            cwd=self.repo_root,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=timeout,
-        )
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=self.repo_root,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return AgentResult(
+                command=command,
+                stdout=_as_text(exc.stdout),
+                stderr=_as_text(exc.stderr) + f"\ntimed out after {timeout}s",
+                returncode=124,
+                timed_out=True,
+            )
         return AgentResult(
             command=command,
             stdout=result.stdout,
             stderr=result.stderr,
             returncode=result.returncode,
         )
+
+
+def _as_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value

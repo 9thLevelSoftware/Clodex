@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clodex"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local Claude Code CLI and Codex CLI workflow orchestration"
 requires-python = ">=3.12"
 

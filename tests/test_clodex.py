@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import runpy
@@ -15,9 +17,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from clodex.commands import claude_plan_command, codex_exec_command, codex_review_command
+from clodex import config as config_module
+from clodex.agents import AgentRunner
+from clodex.commands import AgentCommand, claude_plan_command, codex_exec_command, codex_review_command
 from clodex.config import load_config
-from clodex.jsonutil import extract_json_object
+from clodex.jsonutil import AgentEnvelopeError, extract_json_object
 from clodex.native import (
     BEGIN_MARKER,
     END_MARKER,
@@ -48,6 +52,18 @@ def cli_test_python() -> str | None:
     return None
 
 
+def cleanup_tempdir(tmp: tempfile.TemporaryDirectory, attempts: int = 50) -> None:
+    # Orphaned fake CLI children can briefly hold the directory on Windows.
+    for attempt in range(attempts):
+        try:
+            tmp.cleanup()
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.1)
+
+
 class TempRepo:
     def __enter__(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -62,7 +78,7 @@ class TempRepo:
         return self.path
 
     def __exit__(self, exc_type, exc, tb):
-        self.tmp.cleanup()
+        cleanup_tempdir(self.tmp)
 
 
 class FakeCliPath:
@@ -72,9 +88,11 @@ class FakeCliPath:
         malformed_once: bool = False,
         sleep_seconds: float = 0,
         include_clodex: bool = False,
+        envelope_error_once: bool = False,
     ):
         self.reject_once = reject_once
         self.malformed_once = malformed_once
+        self.envelope_error_once = envelope_error_once
         self.sleep_seconds = sleep_seconds
         self.include_clodex = include_clodex
 
@@ -93,7 +111,7 @@ class FakeCliPath:
         os.environ["PATH"] = self.old_path
         if os.name == "nt":
             os.environ["PATHEXT"] = self.old_pathext
-        self.tmp.cleanup()
+        cleanup_tempdir(self.tmp)
 
     def _write_fake(self):
         fake = self.bin / "fake_cli.py"
@@ -109,15 +127,15 @@ from pathlib import Path
 
 name = sys.argv[1]
 args = sys.argv[2:]
+if '--version' in args:
+    # Answer before reading stdin: callers like `doctor` don't close it.
+    print(name + ' fake 1.0.0')
+    raise SystemExit(0)
 stdin = sys.stdin.read()
 
 if {self.sleep_seconds!r}:
     import time
     time.sleep({self.sleep_seconds!r})
-
-if '--version' in args:
-    print(name + ' fake 1.0.0')
-    raise SystemExit(0)
 
 def diff_hash():
     out = subprocess.run(['git', 'diff', '--binary', 'HEAD'], capture_output=True, text=True, encoding='utf-8').stdout
@@ -127,52 +145,118 @@ def requested_hash():
     match = re.search(r'Diff hash: ([a-f0-9]{{64}})', stdin)
     return match.group(1) if match else diff_hash()
 
+def fail(message):
+    sys.stderr.write(message + '\\n')
+    raise SystemExit(2)
+
+def parse_flags(value_flags, bool_flags):
+    # Strict like the real CLIs: unknown flags and positional args exit 2.
+    parsed = {{}}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '-':
+            i += 1
+        elif arg in bool_flags:
+            parsed[arg] = True
+            i += 1
+        elif arg in value_flags:
+            if i + 1 >= len(args):
+                fail("error: a value is required for '" + arg + "'")
+            parsed.setdefault(arg, []).append(args[i + 1])
+            i += 2
+        else:
+            fail("error: unexpected argument '" + arg + "' found")
+    return parsed
+
+def audit_verdict(approved, summary, fixes):
+    h = requested_hash()
+    reviewer = 'claude-plan' if name == 'claude' else 'codex-architecture'
+    persona = 'plan-adherence' if name == 'claude' else 'architecture'
+    reviewer_match = re.search(r'Reviewer ID: ([^\\n]+)', stdin)
+    persona_match = re.search(r'Persona: ([^\\n]+)', stdin)
+    if reviewer_match:
+        reviewer = reviewer_match.group(1).strip()
+    if persona_match:
+        persona = persona_match.group(1).strip()
+    return json.dumps({{'approved': approved, 'diff_hash': h, 'reviewer_id': reviewer, 'persona': persona, 'summary': summary, 'findings': [], 'required_fixes': fixes}})
+
 if name == 'claude':
+    flags = parse_flags(
+        {{'--model', '--effort', '--permission-mode', '--output-format', '--json-schema', '--fallback-model', '--max-budget-usd', '--append-system-prompt'}},
+        {{'-p', '--print', '--bare'}},
+    )
+    if '-p' not in flags and '--print' not in flags:
+        fail('error: fake claude only supports --print mode')
+    if flags.get('--effort', ['high'])[-1] not in ('low', 'medium', 'high', 'xhigh', 'max'):
+        fail('error: invalid --effort')
+    if flags.get('--permission-mode', ['plan'])[-1] not in ('acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'):
+        fail('error: invalid --permission-mode')
+    as_json = flags.get('--output-format', ['text'])[-1] == 'json'
+
+    def emit(text, is_error=False):
+        if as_json:
+            # The real `claude -p --output-format json` wraps the answer in an envelope.
+            print(json.dumps({{'type': 'result', 'subtype': 'success', 'is_error': is_error, 'result': text, 'total_cost_usd': 0, 'session_id': 'fake'}}))
+        else:
+            print(text)
+        raise SystemExit(0)
+
+    error_marker = Path('.fake-claude-envelope-error')
+    if {str(self.envelope_error_once)!r} == 'True' and not error_marker.exists():
+        error_marker.write_text('seen')
+        emit('Not logged in', is_error=True)
     marker = Path('.fake-claude-malformed')
     if {str(self.malformed_once)!r} == 'True' and not marker.exists():
         marker.write_text('seen')
-        print('not json')
-        raise SystemExit(0)
+        emit('not json')
     if 'adversarial auditor' in stdin:
-        h = requested_hash()
-        reviewer = 'claude-plan'
-        persona = 'plan-adherence'
-        reviewer_match = re.search(r'Reviewer ID: ([^\\n]+)', stdin)
-        persona_match = re.search(r'Persona: ([^\\n]+)', stdin)
-        if reviewer_match:
-            reviewer = reviewer_match.group(1).strip()
-        if persona_match:
-            persona = persona_match.group(1).strip()
         reject_marker = Path('.fake-claude-reject')
         if {str(self.reject_once)!r} == 'True' and not reject_marker.exists():
             reject_marker.write_text('seen')
-            print(json.dumps({{'approved': False, 'diff_hash': h, 'reviewer_id': reviewer, 'persona': persona, 'summary': 'reject once', 'findings': [], 'required_fixes': ['append fixed line']}}))
-        else:
-            print(json.dumps({{'approved': True, 'diff_hash': h, 'reviewer_id': reviewer, 'persona': persona, 'summary': 'ok', 'findings': [], 'required_fixes': []}}))
-    else:
-        print(json.dumps({{'goal': 'test goal', 'scope': ['repo'], 'out_of_scope': [], 'implementation_spec': ['write implemented.txt'], 'acceptance_criteria': ['diff exists'], 'risks': [], 'test_commands': ['python -m unittest']}}))
-    raise SystemExit(0)
+            emit(audit_verdict(False, 'reject once', ['append fixed line']))
+        emit(audit_verdict(True, 'ok', []))
+    emit(json.dumps({{'goal': 'test goal', 'scope': ['repo'], 'out_of_scope': [], 'implementation_spec': ['write implemented.txt'], 'acceptance_criteria': ['diff exists'], 'risks': [], 'test_commands': ['python -m unittest']}}))
 
 if name == 'codex':
-    if args and args[0] == 'review':
-        h = requested_hash()
-        reviewer = 'codex-architecture'
-        persona = 'architecture'
-        reviewer_match = re.search(r'Reviewer ID: ([^\\n]+)', stdin)
-        persona_match = re.search(r'Persona: ([^\\n]+)', stdin)
-        if reviewer_match:
-            reviewer = reviewer_match.group(1).strip()
-        if persona_match:
-            persona = persona_match.group(1).strip()
-        print(json.dumps({{'approved': True, 'diff_hash': h, 'reviewer_id': reviewer, 'persona': persona, 'summary': 'ok', 'findings': [], 'required_fixes': []}}))
+    if not args or args[0] != 'exec':
+        fail("error: fake codex only supports the `exec` subcommand")
+    args = args[1:]
+    flags = parse_flags(
+        {{'-m', '-c', '-s', '--sandbox', '-C', '--output-schema', '-o', '--output-last-message'}},
+        {{'--approve-for-me', '--json', '--ephemeral', '--skip-git-repo-check', '--strict-config'}},
+    )
+    for item in flags.get('-c', []):
+        key, _, value = item.partition('=')
+        value = value.strip('"')
+        if key == 'model_reasoning_effort':
+            if value not in ('low', 'medium', 'high', 'xhigh', 'max', 'ultra'):
+                fail('error: invalid model_reasoning_effort ' + value)
+        elif key == 'approval_policy':
+            if value not in ('untrusted', 'on-failure', 'on-request', 'never'):
+                fail('error: invalid approval_policy ' + value)
+        elif key != 'model':
+            fail('error: unknown config key ' + key)
+    sandbox = (flags.get('-s') or flags.get('--sandbox') or ['read-only'])[-1]
+    if sandbox not in ('read-only', 'workspace-write', 'danger-full-access'):
+        fail('error: invalid sandbox ' + sandbox)
+    if '-C' in flags:
+        os.chdir(flags['-C'][-1])
+
+    def finish(text):
+        out = flags.get('-o') or flags.get('--output-last-message')
+        if out:
+            Path(out[-1]).write_text(text, encoding='utf-8')
+        print(text)
         raise SystemExit(0)
+
+    if 'adversarial auditor' in stdin:
+        finish(audit_verdict(True, 'ok', []))
     if 'Required fixes' in stdin:
         Path('implemented.txt').write_text('implemented\\nfixed\\n', encoding='utf-8')
-        print('fixed implementation')
-    else:
-        Path('implemented.txt').write_text('implemented\\n', encoding='utf-8')
-        print('implemented')
-    raise SystemExit(0)
+        finish('fixed implementation')
+    Path('implemented.txt').write_text('implemented\\n', encoding='utf-8')
+    finish('implemented')
 
 raise SystemExit(2)
 """,
@@ -200,7 +284,7 @@ class ClodexTests(unittest.TestCase):
             config = load_config(repo)
             self.assertEqual(config.claude["model"], "opus")
             self.assertEqual(config.claude["effort"], "max")
-            self.assertEqual(config.codex["model"], "gpt-5.5")
+            self.assertEqual(config.codex["model"], "gpt-6.1-sol")
             self.assertEqual(config.codex["reasoning_effort"], "xhigh")
             self.assertEqual(config.workspace["backend"], "git-worktree")
             self.assertEqual(config.workspace["apply_mode"], "manual")
@@ -210,7 +294,9 @@ class ClodexTests(unittest.TestCase):
             self.assertGreaterEqual(len(config.reviewers), 2)
             self.assertIn("--permission-mode", claude_plan_command(config).argv)
             self.assertIn("model_reasoning_effort=\"xhigh\"", codex_exec_command(config, repo).argv)
-            self.assertIn("--uncommitted", codex_review_command(config).argv)
+            audit_argv = codex_review_command(config, repo).argv
+            self.assertEqual(audit_argv[:2], ["codex", "exec"])
+            self.assertIn("read-only", audit_argv)
 
     def test_approval_profiles_change_codex_command(self):
         with TempRepo() as repo:
@@ -218,9 +304,12 @@ class ClodexTests(unittest.TestCase):
             ci = codex_exec_command(config, repo).argv
             local = codex_exec_command(config, repo, approval_profile="local").argv
             auto = codex_exec_command(config, repo, approval_profile="auto_review").argv
-            self.assertIn("never", ci)
-            self.assertIn("on-request", local)
-            self.assertIn("approvals_reviewer=\"auto_review\"", auto)
+            self.assertIn('approval_policy="never"', ci)
+            self.assertIn('approval_policy="never"', local)
+            self.assertIn("--approve-for-me", auto)
+            self.assertNotIn('approval_policy="never"', auto)
+            for argv in (ci, local, auto):
+                self.assertNotIn("--ask-for-approval", argv)
 
     def test_state_migrations_add_v2_tables(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -854,6 +943,69 @@ class ClodexTests(unittest.TestCase):
         with TempRepo() as repo, FakeCliPath(malformed_once=True):
             result = ClodexWorkflow(repo).plan("plan fixture")
             self.assertEqual(result.status, "planned")
+
+    def test_claude_envelope_string_result_is_unwrapped(self):
+        envelope = {"type": "result", "subtype": "success", "is_error": False, "result": '{"goal": "x"}'}
+        self.assertEqual(extract_json_object(json.dumps(envelope)), {"goal": "x"})
+        envelope["structured_output"] = {"goal": "structured"}
+        self.assertEqual(extract_json_object(json.dumps(envelope)), {"goal": "structured"})
+
+    def test_claude_envelope_error_is_raised(self):
+        envelope = {"type": "result", "is_error": True, "result": "Not logged in"}
+        with self.assertRaises(AgentEnvelopeError):
+            extract_json_object(json.dumps(envelope))
+
+    def test_envelope_error_retries_once_then_succeeds(self):
+        with TempRepo() as repo, FakeCliPath(envelope_error_once=True):
+            result = ClodexWorkflow(repo).plan("plan fixture")
+            self.assertEqual(result.status, "planned")
+            self.assertEqual(result.data["goal"], "test goal")
+
+    def test_plan_artifact_is_the_plan_not_the_envelope(self):
+        with TempRepo() as repo, FakeCliPath():
+            result = ClodexWorkflow(repo).plan("plan fixture")
+            plan = json.loads((Path(result.artifacts_dir) / "01-claude-plan.json").read_text(encoding="utf-8"))
+            self.assertNotIn("type", plan)
+            self.assertEqual(plan["goal"], "test goal")
+
+    def test_agreement_without_required_reviewers_is_not_approved(self):
+        self.assertFalse(ClodexWorkflow._agreement([], "h", 0)["approved"])
+        optional_only = [{"reviewer_id": "x", "approved": True, "diff_hash": "h", "_required": False}]
+        self.assertFalse(ClodexWorkflow._agreement(optional_only, "h", 0)["approved"])
+
+    def test_fake_codex_rejects_removed_ask_for_approval_flag(self):
+        with TempRepo() as repo, FakeCliPath():
+            old_argv = ["codex", "exec", "-m", "gpt-6.1-sol", "--ask-for-approval", "never", "-"]
+            result = AgentRunner(repo).run(AgentCommand("old-build", old_argv), "prompt")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--ask-for-approval", result.stderr)
+            old_review = ["codex", "review", "--uncommitted", "-"]
+            self.assertEqual(AgentRunner(repo).run(AgentCommand("old-audit", old_review), "prompt").returncode, 2)
+
+    def test_agent_timeout_returns_result_instead_of_raising(self):
+        with TempRepo() as repo, FakeCliPath(sleep_seconds=2):
+            config = load_config(repo)
+            result = AgentRunner(repo).run(claude_plan_command(config), "prompt", timeout=0.3)
+            self.assertTrue(result.timed_out)
+            self.assertEqual(result.returncode, 124)
+            self.assertFalse(result.ok)
+
+    def test_retiring_codex_model_warns_with_replacement(self):
+        with TempRepo() as repo:
+            contract = repo / "CLODEX.md"
+            contract.write_text(contract.read_text(encoding="utf-8").replace("gpt-6.1-sol", "gpt-5.5"), encoding="utf-8")
+            config_module._warned_models.discard("gpt-5.5")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                config = load_config(repo)
+            self.assertEqual(config.codex["model"], "gpt-5.5")
+            self.assertIn("gpt-5.5", stderr.getvalue())
+            self.assertIn("gpt-6.1-sol", stderr.getvalue())
+            self.assertIn("2026-10-14", stderr.getvalue())
+
+    def test_package_json_is_valid_json(self):
+        data = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["name"], "clodex")
 
     def test_mcp_tools_list(self):
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+from datetime import date
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,7 +25,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "permission_mode": "plan",
     },
     "codex": {
-        "model": "gpt-5.5",
+        "model": "gpt-6.1-sol",
         "reasoning_effort": "xhigh",
         "sandbox": "workspace-write",
         "approval_profile": "ci",
@@ -47,6 +49,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
     },
 }
+
+
+# Codex models being retired: model -> (retire date, successor). A fuller
+# registry replaces this once model validation lands.
+RETIRING_CODEX_MODELS: dict[str, tuple[str, str]] = {
+    "gpt-5.5": ("2026-10-14", "gpt-6.1-sol"),
+}
+_warned_models: set[str] = set()
+
+
+def warn_if_model_retiring(model: str) -> None:
+    entry = RETIRING_CODEX_MODELS.get(model)
+    if entry is None or model in _warned_models:
+        return
+    _warned_models.add(model)
+    retire_on, successor = entry
+    verb = "has retired" if date.today() >= date.fromisoformat(retire_on) else "retires"
+    print(
+        f"clodex: warning: Codex model '{model}' {verb} on {retire_on}. "
+        f"Set `model: {successor}` under `codex:` in the CLODEX.md front matter.",
+        file=sys.stderr,
+    )
 
 
 @dataclass(frozen=True)
@@ -119,6 +143,7 @@ def load_config(repo_root: Path | None = None) -> ClodexConfig:
     front_matter, body = split_front_matter(text)
     parsed = parse_minimal_yaml(front_matter)
     merged = deep_merge(DEFAULT_CONFIG, parsed)
+    warn_if_model_retiring(str(merged["codex"].get("model", "")))
     return ClodexConfig(repo_root=root, raw=merged, prompt_body=body.strip())
 
 

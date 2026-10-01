@@ -10,7 +10,7 @@ from .agents import AgentRunner
 from .artifacts import ArtifactStore, current_diff, hash_text, make_run_id, make_task_id
 from .commands import claude_audit_command, claude_plan_command, codex_exec_command, codex_review_command
 from .config import ClodexConfig, load_config
-from .jsonutil import extract_json_object
+from .jsonutil import AgentEnvelopeError, extract_json_object
 from .prompts import audit_prompt, fix_prompt, implementation_prompt, plan_prompt
 from .state import StateStore
 from .trace import TraceWriter
@@ -44,7 +44,7 @@ class ClodexWorkflow:
             "claude_plan": claude_plan_command(self.config).display(),
             "codex_build": codex_exec_command(self.config, root, approval_profile=approval_profile).display(),
             "claude_audit": claude_audit_command(self.config).display(),
-            "codex_audit": codex_review_command(self.config).display(),
+            "codex_audit": codex_review_command(self.config, root).display(),
         }
 
     def plan(self, task: str, dry_run: bool = False) -> WorkflowResult:
@@ -273,7 +273,7 @@ class ClodexWorkflow:
             reviewer_id = str(reviewer.get("id", backend))
             persona = str(reviewer.get("persona", reviewer_id))
             timeout = int(reviewer.get("timeout", 600))
-            command = claude_audit_command(self.config) if backend == "claude" else codex_review_command(self.config)
+            command = claude_audit_command(self.config) if backend == "claude" else codex_review_command(self.config, runner.repo_root)
             verdict = self._run_json_with_retry(
                 runner,
                 command,
@@ -321,6 +321,10 @@ class ClodexWorkflow:
                 raise RuntimeError(f"{label} failed with exit code {result.returncode}: {result.stderr.strip()}")
             try:
                 return extract_json_object(result.stdout)
+            except AgentEnvelopeError as exc:
+                last_error = str(exc)
+                if _attempt == 1:
+                    raise RuntimeError(f"{label} returned an error: {last_error}") from exc
             except ValueError as exc:
                 last_error = str(exc)
                 current_prompt = (
@@ -354,7 +358,7 @@ class ClodexWorkflow:
             for verdict in verdicts
         }
         return {
-            "approved": all(ClodexWorkflow._approved(verdict, diff_hash) for verdict in required),
+            "approved": bool(required) and all(ClodexWorkflow._approved(verdict, diff_hash) for verdict in required),
             "attempt": attempt,
             "diff_hash": diff_hash,
             "reviewers": reviewer_status,

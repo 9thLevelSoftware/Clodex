@@ -49,7 +49,6 @@ def claude_audit_command(config: ClodexConfig) -> AgentCommand:
 def codex_exec_command(config: ClodexConfig, repo_root: Path, approval_profile: str | None = None) -> AgentCommand:
     codex = config.codex
     profile = approval_profile or str(codex.get("approval_profile", "ci"))
-    approval = "never" if profile == "ci" else "on-request"
     argv = [
         "codex",
         "exec",
@@ -59,33 +58,34 @@ def codex_exec_command(config: ClodexConfig, repo_root: Path, approval_profile: 
         f'model_reasoning_effort="{codex["reasoning_effort"]}"',
     ]
     if profile == "auto_review":
-        argv.extend(["-c", 'approvals_reviewer="auto_review"'])
-    argv.extend(
-        [
-            "--sandbox",
-            str(codex["sandbox"]),
-            "--ask-for-approval",
-            approval,
-            "-C",
-            str(repo_root),
-            "-",
-        ]
-    )
+        argv.append("--approve-for-me")
+    else:
+        # `codex exec` is non-interactive and has no --ask-for-approval flag.
+        argv.extend(["-c", 'approval_policy="never"'])
+    argv.extend(["--sandbox", str(codex["sandbox"]), "-C", str(repo_root), "-"])
     return AgentCommand(name="codex-build", argv=argv)
 
 
-def codex_review_command(config: ClodexConfig) -> AgentCommand:
+def codex_review_command(config: ClodexConfig, repo_root: Path) -> AgentCommand:
+    # `codex review --uncommitted` rejects a prompt argument, so audits run as a
+    # read-only `codex exec`; the audit prompt already embeds the diff.
     codex = config.codex
     return AgentCommand(
         name="codex-audit",
         argv=[
             "codex",
-            "review",
-            "--uncommitted",
-            "-c",
-            f'model="{codex["model"]}"',
+            "exec",
+            "-m",
+            str(codex["model"]),
             "-c",
             f'model_reasoning_effort="{codex["reasoning_effort"]}"',
+            "-c",
+            'approval_policy="never"',
+            "--sandbox",
+            "read-only",
+            "--ephemeral",
+            "-C",
+            str(repo_root),
             "-",
         ],
     )

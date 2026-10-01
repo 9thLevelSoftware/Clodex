@@ -5,7 +5,7 @@ It installs repo instructions and MCP tools that let either agent hand work to
 the other without the user manually driving every step.
 
 - **Claude Code** plans first with Opus at max effort.
-- **Codex** implements from that accepted plan with GPT-5.5 at xhigh reasoning.
+- **Codex** implements from that accepted plan with GPT-6.1 Sol at xhigh reasoning.
 - **Both agents audit the same final diff hash** and must agree before the task
   is considered complete.
 
@@ -136,7 +136,7 @@ claude:
   effort: max
   permission_mode: plan
 codex:
-  model: gpt-5.5
+  model: gpt-6.1-sol
   reasoning_effort: xhigh
   sandbox: workspace-write
   approval_profile: ci
