@@ -262,21 +262,32 @@ class StateStore:
         phase: str = "planning",
         handoff_budget: int = 6,
         task_id: str | None = None,
+        workspace_path: str | None = None,
     ) -> dict[str, Any]:
         if handoff_budget < 0:
             raise ValueError("handoff_budget must be non-negative")
+        if phase not in HANDOFF_PHASES:
+            raise ValueError(f"unknown handoff phase: {phase} (use one of {sorted(HANDOFF_PHASES)})")
 
         timestamp = now_iso()
+        task_id = task_id or run_id  # every handoff shows up in the task ledger (`clodex status`)
         with self.session() as con:
             con.execute(
                 """
                 insert into runs(
                     id, task_id, status, prompt, owner, phase, handoff_count,
-                    handoff_budget, created_at, updated_at, started_at
+                    handoff_budget, workspace_path, created_at, updated_at, started_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, task_id, "handoff", prompt, owner, phase, 0, handoff_budget, timestamp, timestamp, timestamp),
+                (run_id, task_id, "handoff", prompt, owner, phase, 0, handoff_budget, workspace_path, timestamp, timestamp, timestamp),
+            )
+            con.execute(
+                """
+                insert into tasks(id, title, status, created_at, updated_at) values (?, ?, ?, ?, ?)
+                on conflict(id) do update set status=excluded.status, updated_at=excluded.updated_at
+                """,
+                (task_id, prompt.strip().splitlines()[0][:200] if prompt.strip() else run_id, "handoff", timestamp, timestamp),
             )
             self._insert_event(
                 con,
@@ -369,6 +380,8 @@ class StateStore:
 
             updated = con.execute("select * from runs where id=?", (run_id,)).fetchone()
             updated_run = dict(updated)
+            self._record_report(con, run_id, actor, report, diff_hash, timestamp)
+            self._sync_task(con, updated_run, timestamp)
             updated_count = _int_or_default(updated_run.get("handoff_count"), 0)
             updated_budget = _int_or_default(updated_run.get("handoff_budget"), 6)
             event_data: dict[str, Any] = {
@@ -430,7 +443,43 @@ class StateStore:
                 timestamp,
             )
             updated = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+            self._sync_task(con, dict(updated), timestamp)
             return dict(updated)
+
+    # Run status -> task status for the ledger; handoff runs in flight leave the task alone.
+    _TASK_STATUS = {"approved": "done", "applied": "done", "completed": "done", "blocked": "blocked", "failed": "failed", "cancelled": "cancelled"}
+
+    def _sync_task(self, con: sqlite3.Connection, run: dict[str, Any], timestamp: str) -> None:
+        task_status = self._TASK_STATUS.get(str(run.get("status")))
+        if task_status and run.get("task_id"):
+            con.execute("update tasks set status=?, updated_at=? where id=?", (task_status, timestamp, run["task_id"]))
+
+    def _record_report(self, con: sqlite3.Connection, run_id: str, actor: str | None, report: dict[str, Any] | None, diff_hash: str | None, timestamp: str) -> None:
+        """Put what a handoff report says into the same ledger the classic workflow uses.
+
+        A verdict (`approved` true/false) becomes an `audits` row, and `artifacts` entries (paths or
+        {name, path, kind}) become `artifacts` rows, so `status`, exports and the MCP tools see them.
+        """
+        if not isinstance(report, dict):
+            return
+        if isinstance(report.get("approved"), bool):
+            agent = str(report.get("reviewer_id") or actor or "unknown")
+            con.execute(
+                "insert into audits(run_id, agent, approved, diff_hash, verdict_json, created_at) values (?, ?, ?, ?, ?, ?)",
+                (run_id, agent, int(report["approved"]), diff_hash or report.get("diff_hash"), json.dumps(report, default=str), timestamp),
+            )
+        artifacts = report.get("artifacts")
+        for item in artifacts if isinstance(artifacts, list) else []:
+            path = item.get("path") if isinstance(item, dict) else item
+            if not isinstance(path, str) or not path.strip():
+                continue
+            name = str(item.get("name")) if isinstance(item, dict) and item.get("name") else Path(path).name
+            kind = str(item.get("kind")) if isinstance(item, dict) and item.get("kind") else (Path(path).suffix.lstrip(".") or "file")
+            con.execute("delete from artifacts where run_id=? and name=?", (run_id, name))
+            con.execute(
+                "insert into artifacts(run_id, name, path, kind, created_at) values (?, ?, ?, ?, ?)",
+                (run_id, name, path, kind, timestamp),
+            )
 
     def get_handoff(self, run_id: str) -> dict[str, Any] | None:
         with self.session() as con:

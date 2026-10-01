@@ -307,6 +307,25 @@ The server speaks MCP `2025-11-25` (and negotiates down to `2025-06-18`, `2025-0
 - `clodex_audit` accepts `base` (everything since that ref diverged) and `commit` (one commit) as
   well as the default uncommitted diff.
 
+### Native handoffs
+
+- **Decisions follow your audit settings.** `clodex_handoff_decide` evaluates the reports recorded
+  with `clodex_handoff_update` against the same `audit.reviewers` and `audit.quorum` as a classic
+  run (`unanimous`, `majority` or a number; only `required` reviewers count). A report is a verdict
+  when it has `approved` and a diff hash (on the update or in the report); it only counts for that
+  hash, a new hash resets everything, and a hashless `approved: false` withdraws the reviewer's
+  approval. `report.reviewer_id` names which configured reviewer the verdict is for; without it
+  the actor (`claude` / `codex`) stands for the first *required* reviewer of that backend, so the
+  default two-reviewer flow needs no extra fields. An unknown `reviewer_id` is rejected. The
+  decision lists `required_pending` and `approved_reviewers` so the orchestrator knows whom to ask.
+- **Workspaces.** `clodex_handoff_create` takes `workspace: "git-worktree" | "local" | "none"`
+  (default `none`). A worktree is an isolated checkout under `.clodex/workspaces/<run-id>` (the
+  repo must have no uncommitted changes to tracked files); if the handoff cannot be recorded the
+  worktree is rolled back. `clodex clean <run-id>` removes it once the handoff has finished.
+- **Ledger.** A handoff gets a row in the task ledger (shown by `clodex status`, kept in step
+  with the run: `done` / `blocked` / `failed`), every verdict report becomes an `audits` row, and
+  `report.artifacts` (paths, or `{name, path, kind}`) become artifact rows.
+
 ## Safety
 
 Clodex defaults to git worktree isolation, Codex `workspace-write` sandboxing,

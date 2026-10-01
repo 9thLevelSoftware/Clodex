@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import sqlite3
+import subprocess
 import sys
 import threading
 import uuid
@@ -12,9 +13,11 @@ from typing import Any
 
 from . import __version__
 from .config import resolve_repo_root
+from .quorum import evaluate_handoff, resolve_reviewer
 from .schemas import validate as validate_schema
 from .tasks import TaskManager
 from .workflow import ClodexWorkflow
+from .workspace import DirtyWorkspaceError, WorkspaceManager
 
 
 TOOLS = [
@@ -105,6 +108,11 @@ TOOLS = [
                 "owner": {"type": "string"},
                 "phase": {"type": "string"},
                 "handoff_budget": {"type": "integer"},
+                "workspace": {
+                    "type": "string",
+                    "enum": ["none", "git-worktree", "local"],
+                    "description": "Give the handoff its own isolated git worktree (or the repo itself) for Codex to work in. Default none.",
+                },
             },
             "required": ["task"],
         },
@@ -112,7 +120,7 @@ TOOLS = [
     {
         "name": "clodex_handoff_update",
         "title": "Update Clodex handoff",
-        "description": "Record native handoff phase, actor, report, status, and budget usage.",
+        "description": "Record native handoff phase, actor, report, status, and budget usage. A report with `approved` and a diff hash is a verdict; `reviewer_id` names which configured reviewer it is for (default: the first required reviewer of the actor's backend).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -532,20 +540,41 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             return call_text(str(exc), is_error=True)
         return {"content": [{"type": "text", "text": json.dumps(result.__dict__, indent=2)}], "isError": False}
     elif name == "clodex_handoff_create":
+        run_id = str(arguments.get("run_id") or f"native-{uuid.uuid4().hex[:12]}")
+        workspace = None
+        manager = WorkspaceManager(workflow.repo_root, workflow.config)
         try:
             handoff_budget = handoff_budget_argument(arguments)
+            task = str(required_argument(arguments, "task"))
+            backend = arguments.get("workspace")
+            if backend not in (None, "none", "git-worktree", "local"):
+                raise ValueError("workspace must be one of: none, git-worktree, local")
+            if backend in {"git-worktree", "local"}:
+                if workflow.state.get_run(run_id) is not None:
+                    raise ValueError(f"run already exists: {run_id}")  # before a worktree is created for it
+                workspace = manager.prepare(run_id, backend)
             run = workflow.state.create_handoff(
-                str(arguments.get("run_id") or f"native-{uuid.uuid4().hex[:12]}"),
-                str(required_argument(arguments, "task")),
+                run_id,
+                task,
                 owner=str(arguments.get("owner") or "claude"),
                 phase=str(arguments.get("phase") or "planning"),
                 handoff_budget=handoff_budget,
+                workspace_path=str(workspace.path) if workspace else None,
             )
-        except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
+            if workspace is not None:
+                workflow.state.add_workspace_lock(run_id, str(workspace.source_path), str(workspace.path), workspace.backend)
+        except (KeyError, TypeError, ValueError, sqlite3.IntegrityError, DirtyWorkspaceError, subprocess.CalledProcessError) as exc:
+            if workspace is not None and workspace.is_worktree:
+                manager.release(workspace.path)  # do not leave a worktree behind for a handoff that was never created
             return call_text(expected_handoff_error(exc), is_error=True)
-        return call_json(run)
+        return call_json({**run, **({"workspace": workspace.as_dict()} if workspace else {})})
     elif name == "clodex_handoff_update":
         try:
+            report_arg = arguments.get("report") if isinstance(arguments.get("report"), dict) else None
+            named = (report_arg or {}).get("reviewer_id")
+            if named is not None and resolve_reviewer(named, workflow.config.reviewers) is None:
+                configured = ", ".join(str(r.get("id")) for r in workflow.config.reviewers)
+                raise ValueError(f"unknown reviewer_id: {named} (configured reviewers: {configured})")
             run = workflow.state.update_handoff(
                 str(required_argument(arguments, "run_id")),
                 phase=arguments.get("phase"),
@@ -580,6 +609,7 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
         run = data["run"]
         status = run.get("status")
+        agreement = evaluate_handoff(data, workflow.config.reviewers, workflow.config.audit.get("quorum", "unanimous"))
         if status == "approved":
             decision = {"decision": "approved", "run_id": run["id"], "diff_hash": run.get("diff_hash")}
             is_error = False
@@ -591,7 +621,7 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 "blocked_reason": run.get("blocked_reason") or run.get("error"),
             }
             is_error = True
-        elif agreement := handoff_agreement(data):
+        elif agreement["approved"]:
             try:
                 approved_run = workflow.state.approve_handoff(run["id"], agreement["diff_hash"], approved_by=agreement["approved_by"])
             except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
@@ -601,6 +631,7 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 "run_id": approved_run["id"],
                 "diff_hash": approved_run.get("diff_hash"),
                 "approved_by": agreement["approved_by"],
+                "approved_reviewers": agreement["approved_reviewers"],
             }
             is_error = False
         else:
@@ -610,6 +641,9 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 "phase": run.get("phase"),
                 "budget_remaining": data["budget_remaining"],
                 "next_expected_actor": data["next_expected_actor"],
+                "required_pending": agreement["required_pending"],
+                "approved_reviewers": agreement["approved_reviewers"],
+                "quorum": agreement["quorum"],
             }
             is_error = False
         workflow.state.add_event(run["id"], "handoff.decide", decision)
@@ -642,57 +676,12 @@ def handoff_budget_argument(arguments: dict[str, Any]) -> int:
     return value
 
 
-def handoff_agreement(data: dict[str, Any]) -> dict[str, Any] | None:
-    latest_hash: str | None = None
-    approvals: set[str] = set()
-    for event in data.get("events") or []:
-        if event.get("event") != "handoff.update":
-            continue
-        event_data = event.get("data")
-        if not isinstance(event_data, dict):
-            continue
-        report = event_data.get("report")
-        if not isinstance(report, dict):
-            report = {}
-        actor = normalized_actor(event_data.get("actor") or report.get("actor"))
-        diff_hash = normalized_diff_hash(event_data.get("diff_hash") or report.get("diff_hash"))
-        if diff_hash is None:
-            if latest_hash is not None and actor is not None and report.get("approved") is False:
-                approvals.discard(actor)
-            continue
-        if diff_hash != latest_hash:
-            latest_hash = diff_hash
-            approvals = set()
-        if actor is None:
-            continue
-        if report.get("approved") is True:
-            approvals.add(actor)
-        elif report.get("approved") is False:
-            approvals.discard(actor)
-
-    if latest_hash is not None and {"claude", "codex"}.issubset(approvals):
-        return {"diff_hash": latest_hash, "approved_by": sorted(approvals)}
-    return None
-
-
-def normalized_actor(value: Any) -> str | None:
-    if value is None:
-        return None
-    actor = str(value).strip().lower()
-    return actor if actor in {"claude", "codex"} else None
-
-
-def normalized_diff_hash(value: Any) -> str | None:
-    if value is None:
-        return None
-    diff_hash = str(value).strip()
-    return diff_hash or None
-
-
 def expected_handoff_error(exc: Exception) -> str:
     if isinstance(exc, KeyError):
         key = exc.args[0] if exc.args else "argument"
         return f"Missing required argument: {key}"
+    if isinstance(exc, subprocess.CalledProcessError):
+        return (exc.stderr or "").strip() or str(exc)
     return str(exc)
 
 
