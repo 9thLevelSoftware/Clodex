@@ -4,5 +4,5 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-cd "$REPO_ROOT"
-exec python -m clodex mcp-server
+# Run from the caller's directory so Clodex operates on their repo, not this checkout.
+exec "$REPO_ROOT/bin/clodex" mcp-server

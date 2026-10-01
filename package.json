@@ -25,7 +25,9 @@
     "clodex-mcp-server": "npm/clodex-mcp-server.js"
   },
   "files": [
-    "clodex/*.py",
+    "clodex/**/*.py",
+    "clodex/_vendor/VENDORED.md",
+    "clodex/_vendor/yaml/LICENSE",
     "npm/*.js",
     "bin/clodex",
     "mcp-bridge/bin/clodex-mcp-server",

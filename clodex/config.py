@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-import json
 import sys
 from datetime import date
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+try:
+    import yaml
+except ImportError:  # npm installs have no site-packages PyYAML; use the vendored copy
+    from ._vendor import yaml
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -49,6 +53,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
     },
 }
+
+
+class ConfigError(ValueError):
+    """CLODEX.md could not be loaded."""
 
 
 # Codex models being retired: model -> (retire date, successor). A fuller
@@ -141,68 +149,37 @@ def load_config(repo_root: Path | None = None) -> ClodexConfig:
 
     text = contract.read_text(encoding="utf-8")
     front_matter, body = split_front_matter(text)
-    parsed = parse_minimal_yaml(front_matter)
+    parsed = parse_front_matter(front_matter, str(contract))
     merged = deep_merge(DEFAULT_CONFIG, parsed)
     warn_if_model_retiring(str(merged["codex"].get("model", "")))
     return ClodexConfig(repo_root=root, raw=merged, prompt_body=body.strip())
 
 
 def split_front_matter(text: str) -> tuple[str, str]:
-    if not text.startswith("---"):
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
         return "", text
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return "", text
-    return parts[1], parts[2]
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            return "".join(lines[1:index]), "".join(lines[index + 1 :])
+    return "", text
 
 
-def parse_minimal_yaml(text: str) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    current_section: str | None = None
-    for raw_line in text.splitlines():
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        indent = len(raw_line) - len(raw_line.lstrip(" "))
-        line = raw_line.strip()
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if indent == 0 and value == "":
-            result[key] = {}
-            current_section = key
-            continue
-        target = result
-        if indent > 0 and current_section:
-            section = result.setdefault(current_section, {})
-            if isinstance(section, dict):
-                target = section
-        target[key] = parse_scalar(value)
-    return result
+def parse_front_matter(text: str, source: str = "CLODEX.md") -> dict[str, Any]:
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Invalid YAML front matter in {source}: {exc}") from exc
+    if parsed is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise ConfigError(f"{source} front matter must be a mapping, got {type(parsed).__name__}")
+    return _drop_nulls(parsed)
 
 
-def parse_scalar(value: str) -> Any:
-    if value == "":
-        return ""
-    if value.startswith(("[", "{")) and value.endswith(("]", "}")):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            pass
-    lowered = value.lower()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    if value.isdigit():
-        return int(value)
-    if value.startswith("[") and value.endswith("]"):
-        inner = value[1:-1].strip()
-        if not inner:
-            return []
-        return [item.strip().strip("\"'") for item in inner.split(",")]
-    return value.strip("\"'")
+def _drop_nulls(value: dict[str, Any]) -> dict[str, Any]:
+    """Treat `key:` with no value as unset so it cannot wipe out a default section."""
+    return {key: _drop_nulls(item) if isinstance(item, dict) else item for key, item in value.items() if item is not None}
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
