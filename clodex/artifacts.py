@@ -40,25 +40,23 @@ class ArtifactStore:
         path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return path
 
-    def write_text(self, name: str, text: str) -> Path:
+    def write_text(self, name: str, text: str, exact: bool = False) -> Path:
+        """Write text; `exact=True` keeps bytes as-is (no newline translation), for diffs and patches."""
         path = self.path / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        if exact:
+            path.write_bytes(text.encode("utf-8", errors="surrogateescape"))
+        else:
+            path.write_text(text, encoding="utf-8")
         return path
 
 
 def current_diff(repo_root: Path) -> str:
-    result = subprocess.run(
-        ["git", "diff", "--binary", "HEAD"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    return result.stdout
+    # Read bytes, not text: universal-newline decoding would rewrite CRLF content and
+    # the diff would no longer apply to (or hash like) the real files.
+    result = subprocess.run(["git", "diff", "--binary", "HEAD"], cwd=repo_root, capture_output=True, check=False)
+    return result.stdout.decode("utf-8", errors="surrogateescape")
 
 
 def hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text.encode("utf-8", errors="surrogateescape")).hexdigest()

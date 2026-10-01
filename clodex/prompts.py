@@ -98,7 +98,7 @@ When finished, print a concise Markdown report with changed files and tests run.
 
 def audit_diff_excerpt(diff: str, max_bytes: int) -> str:
     """Cap the diff embedded in an audit prompt; the diff hash still covers the whole diff."""
-    encoded = diff.encode("utf-8")
+    encoded = diff.encode("utf-8", errors="replace")
     if max_bytes <= 0 or len(encoded) <= max_bytes:
         return diff
     shown = encoded[:max_bytes].decode("utf-8", errors="ignore")

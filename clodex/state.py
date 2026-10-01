@@ -499,6 +499,10 @@ class StateStore:
                 (run_id, source_path, workspace_path, backend, now_iso()),
             )
 
+    def release_workspace_lock(self, run_id: str) -> None:
+        with self.session() as con:
+            con.execute("update workspace_locks set released_at=? where run_id=? and released_at is null", (now_iso(), run_id))
+
     def request_cancel(self, run_id: str) -> None:
         with self.session() as con:
             con.execute(

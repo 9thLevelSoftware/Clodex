@@ -47,6 +47,21 @@ class WorkspaceManager:
             subprocess.run(["git", "worktree", "add", "--detach", str(path), "HEAD"], cwd=self.repo_root, check=True, capture_output=True, text=True)
         return WorkspaceRef("git-worktree", self.repo_root, path, True)
 
+    def release(self, path: Path | str) -> bool:
+        """Remove a Clodex-created git worktree. Never touches the source repo or paths outside workspace_root."""
+        target = Path(path).resolve()
+        if target == self.repo_root:
+            return False
+        try:
+            target.relative_to(self.config.workspace_root.resolve())
+        except ValueError:
+            return False
+        if not target.exists():
+            return False
+        subprocess.run(["git", "worktree", "remove", "--force", str(target)], cwd=self.repo_root, capture_output=True, text=True, check=False)
+        subprocess.run(["git", "worktree", "prune"], cwd=self.repo_root, capture_output=True, text=True, check=False)
+        return not target.exists()
+
     def write_metadata(self, run_dir: Path, workspace: WorkspaceRef) -> Path:
         path = run_dir / "workspace.json"
         path.write_text(json.dumps(workspace.as_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
