@@ -11,7 +11,8 @@ from .artifacts import ArtifactStore, current_diff, hash_text, make_run_id, make
 from .commands import claude_audit_command, claude_plan_command, codex_exec_command, codex_review_command
 from .config import ClodexConfig, load_config
 from .jsonutil import AgentEnvelopeError, extract_json_object
-from .prompts import audit_prompt, fix_prompt, implementation_prompt, plan_prompt
+from .prompts import audit_diff_excerpt, audit_prompt, fix_prompt, implementation_prompt, plan_prompt
+from .quorum import evaluate as evaluate_quorum, required_fixes, verdict_approved
 from .schemas import SchemaValidationError, check as check_schema
 from .state import StateStore
 from .trace import TraceWriter
@@ -214,6 +215,8 @@ class ClodexWorkflow:
         include_untracked: bool = False,
     ) -> WorkflowResult:
         agreement: dict[str, Any] = {}
+        block_error: str | None = None
+        quorum = self.config.audit.get("quorum", "unanimous")
         for attempt in range(self.config.max_fix_loops + 1):
             if include_untracked:
                 self._include_untracked(diff_root)
@@ -221,7 +224,7 @@ class ClodexWorkflow:
             diff_hash = hash_text(diff)
             artifacts.write_text("changes.diff", diff)
             verdicts = self._run_reviewers(artifacts, plan_json, diff, diff_hash, runner, trace, attempt)
-            agreement = self._agreement(verdicts, diff_hash, attempt)
+            agreement = self._agreement(verdicts, diff_hash, attempt, quorum)
             artifacts.write_json("05-agreement.json", agreement)
             self.state.update_run(run_id, "approved" if agreement["approved"] else "needs-fix", diff_hash)
             trace.event("audit.agreement", agreement)
@@ -229,18 +232,23 @@ class ClodexWorkflow:
                 self.state.update_task(task_id, "done")
                 trace.event("run.complete", {"status": "approved"})
                 return WorkflowResult("approved", run_id, task_id, str(artifacts.path), agreement)
+            failed = [v for v in verdicts if v.get("_required", True) and v.get("_error")]
+            if failed:
+                # A reviewer that could not run is an infrastructure problem, not something Codex can fix.
+                block_error = "Required reviewer failed: " + "; ".join(f"{v['reviewer_id']}: {v['_error']}" for v in failed)
+                break
             if attempt >= self.config.max_fix_loops:
                 break
-            findings = self._required_fixes(*verdicts)
+            findings = self._required_fixes(*verdicts, diff_hash=diff_hash)
             fix = runner.run(codex_exec_command(self.config, diff_root, approval_profile=approval_profile), fix_prompt(plan_json, findings))
             artifacts.write_text(f"fix-attempt-{attempt}.md", self._format_agent_report(fix.stdout, fix.stderr))
             trace.event("fix.complete", {"attempt": attempt, "returncode": fix.returncode})
             if not fix.ok or self._cancelled(run_id, trace):
                 break
-        self.state.update_run(run_id, "blocked", agreement.get("diff_hash"))
+        self.state.update_run(run_id, "blocked", agreement.get("diff_hash"), error=block_error)
         self.state.update_task(task_id, "blocked")
-        trace.event("run.complete", {"status": "blocked"})
-        return WorkflowResult("blocked", run_id, task_id, str(artifacts.path), agreement)
+        trace.event("run.complete", {"status": "blocked", **({"error": block_error} if block_error else {})})
+        return WorkflowResult("blocked", run_id, task_id, str(artifacts.path), {**agreement, **({"error": block_error} if block_error else {})})
 
     @staticmethod
     def _include_untracked(repo_root: Path) -> None:
@@ -269,27 +277,42 @@ class ClodexWorkflow:
         verdicts: list[dict[str, Any]] = []
         first_claude: dict[str, Any] | None = None
         first_codex: dict[str, Any] | None = None
+        shown_diff = audit_diff_excerpt(diff, int(self.config.audit.get("max_diff_bytes", 200_000)))
         for reviewer in self.config.reviewers:
             backend = str(reviewer.get("backend", "codex"))
             reviewer_id = str(reviewer.get("id", backend))
             persona = str(reviewer.get("persona", reviewer_id))
             timeout = int(reviewer.get("timeout", 600))
+            required = bool(reviewer.get("required", True))
             command = claude_audit_command(self.config) if backend == "claude" else codex_review_command(self.config, runner.repo_root)
-            verdict = self._run_json_with_retry(
-                runner,
-                command,
-                audit_prompt(backend.title(), plan_json, diff, diff_hash, reviewer_id, persona),
-                f"{reviewer_id} audit",
-                trace,
-                timeout=timeout,
-            )
+            try:
+                verdict = self._run_json_with_retry(
+                    runner,
+                    command,
+                    audit_prompt(backend.title(), plan_json, shown_diff, diff_hash, reviewer_id, persona),
+                    f"{reviewer_id} audit",
+                    trace,
+                    timeout=timeout,
+                )
+            except RuntimeError as exc:
+                # One flaky or timed-out reviewer must not abort the whole audit.
+                verdict = {
+                    "approved": False,
+                    "diff_hash": None,
+                    "summary": f"reviewer failed: {exc}",
+                    "findings": [],
+                    "required_fixes": [],
+                    "_error": str(exc),
+                }
+                trace.event("audit.reviewer_failed", {"reviewer_id": reviewer_id, "required": required, "error": str(exc)})
             verdict.setdefault("reviewer_id", reviewer_id)
             verdict.setdefault("persona", persona)
-            verdict["_required"] = bool(reviewer.get("required", True))
+            verdict["_required"] = required
+            approved = verdict_approved(verdict, diff_hash)
             artifacts.write_json(f"reviewers/{reviewer_id}.json", verdict)
             artifacts.write_json(f"audit-attempt-{attempt}-{reviewer_id}.json", verdict)
-            self.state.add_audit(artifacts.run_id, reviewer_id, self._approved(verdict, diff_hash), verdict.get("diff_hash"), json.dumps(verdict))
-            trace.event("audit.verdict", {"reviewer_id": reviewer_id, "approved": self._approved(verdict, diff_hash), "required": verdict["_required"]})
+            self.state.add_audit(artifacts.run_id, reviewer_id, approved, verdict.get("diff_hash"), json.dumps(verdict))
+            trace.event("audit.verdict", {"reviewer_id": reviewer_id, "approved": approved, "required": required})
             verdicts.append(verdict)
             if backend == "claude" and first_claude is None:
                 first_claude = verdict
@@ -354,43 +377,15 @@ class ClodexWorkflow:
 
     @staticmethod
     def _approved(audit: dict[str, Any], diff_hash: str) -> bool:
-        return bool(audit.get("approved")) and audit.get("diff_hash") == diff_hash
+        return verdict_approved(audit, diff_hash)
 
     @staticmethod
-    def _agreement(verdicts: list[dict[str, Any]], diff_hash: str, attempt: int) -> dict[str, Any]:
-        required = [verdict for verdict in verdicts if verdict.get("_required", True)]
-        reviewer_status = {
-            str(verdict.get("reviewer_id")): {
-                "approved": ClodexWorkflow._approved(verdict, diff_hash),
-                "required": bool(verdict.get("_required", True)),
-                "diff_hash": verdict.get("diff_hash"),
-                "persona": verdict.get("persona"),
-            }
-            for verdict in verdicts
-        }
-        return {
-            "approved": bool(required) and all(ClodexWorkflow._approved(verdict, diff_hash) for verdict in required),
-            "attempt": attempt,
-            "diff_hash": diff_hash,
-            "reviewers": reviewer_status,
-            "claude_approved": reviewer_status.get("claude-plan", {}).get("approved", False),
-            "codex_approved": reviewer_status.get("codex-architecture", {}).get("approved", False),
-        }
+    def _agreement(verdicts: list[dict[str, Any]], diff_hash: str, attempt: int, quorum: Any = "unanimous") -> dict[str, Any]:
+        return evaluate_quorum(verdicts, diff_hash, attempt, quorum)
 
     @staticmethod
-    def _required_fixes(*audits: dict[str, Any]) -> list[str]:
-        fixes: list[str] = []
-        for audit in audits:
-            if not audit.get("_required", True) and audit.get("approved"):
-                continue
-            for fix in audit.get("required_fixes", []) or []:
-                fixes.append(str(fix))
-            for finding in audit.get("findings", []) or []:
-                if isinstance(finding, dict):
-                    fixes.append(str(finding.get("message", finding)))
-                else:
-                    fixes.append(str(finding))
-        return fixes or ["Resolve audit disagreement and make the diff satisfy the accepted plan."]
+    def _required_fixes(*audits: dict[str, Any], diff_hash: str) -> list[str]:
+        return required_fixes(list(audits), diff_hash)
 
     @staticmethod
     def _format_agent_report(stdout: str, stderr: str) -> str:

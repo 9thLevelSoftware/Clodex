@@ -64,12 +64,18 @@ class FakeCliPath:
         envelope_error_once: bool = False,
         no_structured_output: bool = False,
         schema_violation_once: bool = False,
+        fail_reviewers: tuple[str, ...] = (),
+        slow_reviewers: tuple[str, ...] = (),
+        reject_reviewers: tuple[str, ...] = (),
     ):
         self.reject_once = reject_once
         self.malformed_once = malformed_once
         self.envelope_error_once = envelope_error_once
         self.no_structured_output = no_structured_output
         self.schema_violation_once = schema_violation_once
+        self.fail_reviewers = tuple(fail_reviewers)
+        self.slow_reviewers = tuple(slow_reviewers)
+        self.reject_reviewers = tuple(reject_reviewers)
         self.sleep_seconds = sleep_seconds
         self.include_clodex = include_clodex
 
@@ -156,6 +162,16 @@ def audit_verdict(approved, summary, fixes):
         reviewer = reviewer_match.group(1).strip()
     if persona_match:
         persona = persona_match.group(1).strip()
+    if reviewer in {self.fail_reviewers!r}:
+        sys.stderr.write('simulated reviewer crash: ' + reviewer + '\\n')
+        raise SystemExit(3)
+    if reviewer in {self.slow_reviewers!r}:
+        import time
+        time.sleep(4)
+    if reviewer in {self.reject_reviewers!r}:
+        approved = False
+        summary = 'rejected by ' + reviewer
+        fixes = ['fix from ' + reviewer]
     return json.dumps({{'approved': approved, 'diff_hash': h, 'reviewer_id': reviewer, 'persona': persona, 'summary': summary, 'findings': [], 'required_fixes': fixes}})
 
 if name == 'claude':

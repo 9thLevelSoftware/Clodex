@@ -37,6 +37,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "audit": {
         "quorum": "unanimous",
+        "max_diff_bytes": 200000,
         "personas": ["security", "performance", "portability", "test-gap"],
         "reviewers": [
             {"id": "claude-plan", "backend": "claude", "persona": "plan-adherence", "required": True, "timeout": 600},

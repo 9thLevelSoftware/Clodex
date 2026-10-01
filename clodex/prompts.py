@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .config import ClodexConfig
@@ -93,3 +94,17 @@ Required fixes:
 
 When finished, print a concise Markdown report with changed files and tests run.
 """
+
+
+def audit_diff_excerpt(diff: str, max_bytes: int) -> str:
+    """Cap the diff embedded in an audit prompt; the diff hash still covers the whole diff."""
+    encoded = diff.encode("utf-8")
+    if max_bytes <= 0 or len(encoded) <= max_bytes:
+        return diff
+    shown = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    files = list(dict.fromkeys(re.findall(r"^diff --git a/(.+?) b/", diff, flags=re.MULTILINE)))
+    return (
+        f"{shown}\n\n[diff truncated: showing the first {max_bytes} of {len(encoded)} bytes. "
+        f"Changed files ({len(files)}): {', '.join(files)}. "
+        "Reject if the omitted part could hide a problem you cannot rule out.]\n"
+    )
