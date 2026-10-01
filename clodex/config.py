@@ -155,9 +155,17 @@ class ClodexConfig:
 
 
 def resolve_repo_root() -> Path:
-    """The repo Clodex should work on: $CLODEX_REPO_ROOT if set (MCP clients start servers from anywhere), else the git root above the cwd."""
-    override = os.environ.get("CLODEX_REPO_ROOT")
-    return find_repo_root(Path(override)) if override else find_repo_root()
+    """The repo Clodex should work on.
+
+    $CLODEX_REPO_ROOT wins. Claude Code sets $CLAUDE_PROJECT_DIR for the MCP servers and hooks it
+    starts, which matters because user-scope servers run with ~/.claude as their cwd. Otherwise
+    use the git root above the current directory.
+    """
+    for variable in ("CLODEX_REPO_ROOT", "CLAUDE_PROJECT_DIR"):
+        override = os.environ.get(variable)
+        if override and Path(override).is_dir():
+            return find_repo_root(Path(override))
+    return find_repo_root()
 
 
 def find_repo_root(start: Path | None = None) -> Path:

@@ -1,3 +1,9 @@
+---
+description: Plan with Claude, implement with Codex, then audit with both
+argument-hint: <task description>
+allowed-tools: Bash(clodex build:*)
+---
+
 # /clodex-build
 
 Run:

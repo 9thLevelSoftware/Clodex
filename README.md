@@ -29,7 +29,52 @@ agreement.
 `clodex init` writes managed Clodex blocks to `CLAUDE.md`, `AGENTS.md`, and
 `CLODEX.md`. By default it also configures the repo MCP server through
 `.mcp.json` and `.codex/config.toml`; use `--no-mcp-config` when you want
-instructions only.
+instructions only. From a subdirectory, `clodex init` still works on the repository root.
+
+Those two files are meant to be committed, so they use the portable `clodex mcp-server`
+command (wrapped as `cmd /c clodex mcp-server` when `init` runs on Windows and only a `.cmd`
+shim exists, because Windows MCP clients cannot start those directly). Re-run `clodex init`
+if a teammate on another platform needs the other form.
+
+### User-level install (`clodex init --global`)
+
+Writes where each agent actually reads user-level files, not your home directory root:
+
+| What | Where |
+| --- | --- |
+| Claude instructions | `~/.claude/CLAUDE.md` (or `$CLAUDE_CONFIG_DIR/CLAUDE.md`) |
+| Codex instructions | `~/.codex/AGENTS.md` (or `$CODEX_HOME/AGENTS.md`) |
+| Codex MCP server | `~/.codex/config.toml` |
+| Claude MCP server | registered with `claude mcp add-json clodex ... --scope user` (Claude Code owns `~/.claude.json`) |
+
+These use an absolute, environment-independent command (the Node launcher for npm installs,
+otherwise your Python), so they work regardless of PATH or working directory. Claude Code starts
+user-scope servers with `~/.claude` as the working directory, so Clodex finds your project from
+`$CLAUDE_PROJECT_DIR`, which Claude Code sets. If the `claude` CLI is not on PATH, `init --global`
+prints the command to run yourself.
+
+### Claude Code hooks
+
+```bash
+clodex hooks install            # .claude/settings.local.json (default, not committed)
+clodex hooks install --scope user
+clodex hooks uninstall
+```
+
+Records `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `SubagentStart/Stop`, `TaskCreated`,
+`TaskCompleted`, `WorktreeCreate/Remove` and `Stop` events to
+`.clodex/runs/<session-id>/events/claude-hooks.jsonl` and the trace. Your other hooks and settings
+are left alone and re-running is safe. The hook command is silent and never exits with code 2
+(Claude Code treats that as "block"). Tool events are deliberately not hooked: each hook is a
+process, which would slow every tool call.
+
+### Plugin
+
+The repository is also a Claude Code plugin (`claude --plugin-dir <this repo>`): slash commands
+`/clodex:clodex-plan`, `/clodex:clodex-build` and `/clodex:clodex-audit`, the `clodex-workflow`
+skill, and the MCP server (needs `node`; the launcher finds Python). `claude plugin validate .
+--strict` passes. `install.sh` installs a self-contained copy under `~/.clodex/plugin` and a
+launcher in `~/.local/bin`; re-running replaces rather than nests, and `uninstall.sh` removes it.
 
 Native coordination uses these MCP tools:
 
@@ -121,7 +166,7 @@ PowerShell:
 | `clodex clean <run-id>` | Remove the kept git worktree of a finished run (artifacts and patch stay) |
 | `clodex task start/get/cancel/list` | Manage durable async runs |
 | `clodex trace export <run-id>` | Print a run trace as JSONL |
-| `clodex hooks print/install/ingest` | Generate or ingest Claude Code hook events |
+| `clodex hooks print/install/uninstall/ingest` | Manage the Claude Code hook integration (`install --scope local\|project\|user`) |
 | `clodex eval run` | Run local harness smoke evals |
 | `clodex queue add/list/update` | Manage the local task ledger |
 | `clodex status` | Show recent tasks and runs |

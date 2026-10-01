@@ -10,7 +10,7 @@ from typing import Any
 from .config import ConfigError, resolve_repo_root
 from .doctor import run_doctor
 from .evals import run_local_evals
-from .hooks import hook_config, ingest_hook_event
+from .hooks import derive_run_id, hook_config, ingest_hook_event, install_hooks, parse_hook_payload
 from .mcp_server import main as mcp_main
 from .migrate import migrate_contract
 from .models import ModelRetiredError
@@ -143,11 +143,15 @@ def _main(argv: list[str] | None = None) -> int:
 
     hooks = sub.add_parser("hooks", help="Print or ingest Claude Code hook events")
     hooks_sub = hooks.add_subparsers(dest="hooks_command", required=True)
-    hooks_sub.add_parser("print")
-    hooks_install = hooks_sub.add_parser("install")
-    hooks_install.add_argument("--dry-run", action="store_true", required=True)
-    hooks_ingest = hooks_sub.add_parser("ingest")
-    hooks_ingest.add_argument("--run-id", default="manual-hook-event")
+    hooks_sub.add_parser("print", help="Print the hooks block for a Claude Code settings file")
+    for name, help_text in (("install", "Add Clodex's hooks to a Claude Code settings file"), ("uninstall", "Remove Clodex's hooks again")):
+        hooks_edit = hooks_sub.add_parser(name, help=help_text)
+        hooks_edit.add_argument("--scope", choices=["local", "project", "user"], default="local", help="local: .claude/settings.local.json (default), project: .claude/settings.json, user: ~/.claude/settings.json")
+        hooks_edit.add_argument("--dry-run", action="store_true")
+        hooks_edit.add_argument("--force", action="store_true", help="Replace a settings file that is not valid JSON")
+    hooks_ingest = hooks_sub.add_parser("ingest", help="Record one hook event from stdin (used by the installed hooks)")
+    hooks_ingest.add_argument("--run-id", default=None, help="Default: $CLODEX_RUN_ID, else the session id from the payload")
+    hooks_ingest.add_argument("--verbose", action="store_true", help="Print the result (hooks must stay silent: stdout can reach Claude's context)")
 
     sub.add_parser("status", help="Show recent tasks and runs")
     sub.add_parser("mcp-server", help="Run the Clodex MCP stdio server")
@@ -316,14 +320,23 @@ def handle_trace(args: argparse.Namespace, workflow: ClodexWorkflow, as_json: bo
 
 def handle_hooks(args: argparse.Namespace, as_json: bool) -> int:
     if args.hooks_command == "print":
-        print_output(hook_config(resolve_repo_root()), as_json)
+        print_output(hook_config(), as_json)
         return 0
-    if args.hooks_command == "install":
-        print_output({"dry_run": True, "config": hook_config(resolve_repo_root())}, as_json)
+    if args.hooks_command in {"install", "uninstall"}:
+        result = install_hooks(resolve_repo_root(), args.scope, dry_run=args.dry_run, remove=args.hooks_command == "uninstall", force=args.force)
+        print_output(result, as_json)
         return 0
     if args.hooks_command == "ingest":
-        payload = json.loads(sys.stdin.read() or "{}")
-        print_output(ingest_hook_event(resolve_repo_root(), args.run_id, payload), as_json)
+        # A hook that exits 2 blocks the action it is attached to, and its stdout can reach
+        # Claude's context: so never fail loudly, and stay silent unless asked.
+        try:
+            payload = parse_hook_payload(sys.stdin.read())
+            result = ingest_hook_event(resolve_repo_root(), derive_run_id(args.run_id, payload), payload)
+        except Exception as exc:  # noqa: BLE001
+            print(f"clodex hooks ingest: {exc}", file=sys.stderr)
+            return 1
+        if args.verbose or as_json:
+            print_output(result, as_json)
         return 0
     return 2
 

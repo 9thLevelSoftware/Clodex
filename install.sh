@@ -15,7 +15,7 @@ Clodex Installer v${SCRIPT_VERSION}
 Usage: install.sh [OPTIONS]
 
 Options:
-  -t, --target PATH   Install plugin metadata to PATH (default: ~/.clodex)
+  -t, --target PATH   Install the plugin payload under PATH (default: ~/.clodex)
   -b, --bin PATH      Install clodex launcher to PATH (default: ~/.local/bin)
   -f, --force         Overwrite existing launcher
       --dry-run       Show actions without writing files
@@ -118,31 +118,45 @@ log "Source: $SCRIPT_DIR"
 log "Target: $TARGET_DIR"
 log "Bin:    $BIN_DIR"
 
+LAUNCHER="$BIN_DIR/clodex"
+PLUGIN_DIR="$TARGET_DIR/plugin"
+
 if [[ "$DRY_RUN" == true ]]; then
-    log "dry-run: would install clodex launcher and plugin metadata"
+    log "dry-run: would install the plugin payload to $PLUGIN_DIR and the launcher to $LAUNCHER"
     exit 0
 fi
 
-mkdir -p "$TARGET_DIR" "$BIN_DIR"
-cp -R "$SCRIPT_DIR/.claude-plugin" "$TARGET_DIR/claude-plugin"
-cp -R "$SCRIPT_DIR/.codex-plugin" "$TARGET_DIR/codex-plugin"
-cp -R "$SCRIPT_DIR/dist" "$TARGET_DIR/dist"
-cp -R "$SCRIPT_DIR/skills/clodex-workflow" "$TARGET_DIR/clodex-workflow-skill"
-
-LAUNCHER="$BIN_DIR/clodex"
+# Check everything that can refuse *before* writing anything, so a refusal never leaves a partial install.
 if [[ -e "$LAUNCHER" && "$FORCE" != true ]]; then
     log "launcher exists: $LAUNCHER"
     log "rerun with --force to overwrite"
     exit 1
 fi
 
+mkdir -p "$TARGET_DIR" "$BIN_DIR"
+
+# One self-contained directory that keeps the layout the plugin manifests refer to
+# ("./dist/...", "${CLAUDE_PLUGIN_ROOT}/npm/..."). It is staged and swapped in, so re-running
+# replaces it (never nests) and the install no longer depends on this checkout staying put.
+PAYLOAD=(clodex .claude-plugin .codex-plugin dist skills npm package.json README.md CLODEX.md)
+STAGE="$(mktemp -d "$TARGET_DIR/.plugin-stage.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+for item in "${PAYLOAD[@]}"; do
+    cp -R "$SCRIPT_DIR/$item" "$STAGE/$item"
+done
+find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} +
+rm -rf "$PLUGIN_DIR"
+mv "$STAGE" "$PLUGIN_DIR"
+trap - EXIT
+
 cat > "$LAUNCHER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-export PYTHONPATH="$SCRIPT_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+export PYTHONPATH="$PLUGIN_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
 exec "$PYTHON_BIN" -m clodex "\$@"
 EOF
 chmod +x "$LAUNCHER"
 
 log "installed: $LAUNCHER"
+log "plugin:    $PLUGIN_DIR   (try: claude --plugin-dir \"$PLUGIN_DIR\")"
 log "run: clodex doctor"

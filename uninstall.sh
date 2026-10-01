@@ -62,6 +62,8 @@ add_if_exists() {
 }
 
 add_if_exists "$BIN_DIR/clodex"
+add_if_exists "$TARGET_DIR/plugin"
+# Layout used by installers before 0.2.0:
 add_if_exists "$TARGET_DIR/claude-plugin"
 add_if_exists "$TARGET_DIR/codex-plugin"
 add_if_exists "$TARGET_DIR/dist"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .doctor import run_doctor
+from .launcher import mcp_server_entry
 
 
 BEGIN_MARKER = "<!-- BEGIN CLODEX -->"
@@ -32,10 +34,6 @@ class NativeFilePlan:
     current_status: str
     content: str
     preview: str
-
-
-def normalize_block_body(body: str) -> str:
-    return body if body.endswith("\n") else body + "\n"
 
 
 def replace_managed_block(existing: str, body: str, *, force: bool = False) -> tuple[str, bool]:
@@ -118,11 +116,11 @@ clodex status
 """
 
 
-def clodex_mcp_server_entry() -> dict[str, Any]:
-    return {"command": "clodex", "args": ["mcp-server"]}
+def clodex_mcp_server_entry(portable: bool = True) -> dict[str, Any]:
+    return mcp_server_entry(portable=portable)
 
 
-def render_mcp_json(existing: str, *, force: bool = False) -> str:
+def render_mcp_json(existing: str, *, force: bool = False, entry: dict[str, Any] | None = None) -> str:
     newline = _detect_newline(existing)
     text = existing.strip()
     if not text:
@@ -148,18 +146,18 @@ def render_mcp_json(existing: str, *, force: bool = False) -> str:
                 raise ManagedBlockError(".mcp.json mcpServers must be an object")
             servers = {}
             data["mcpServers"] = servers
-    servers["clodex"] = clodex_mcp_server_entry()
+    servers["clodex"] = entry or clodex_mcp_server_entry()
     return (json.dumps(data, indent=2, sort_keys=True) + "\n").replace("\n", newline)
 
 
-def codex_mcp_block() -> str:
-    return """[mcp_servers.clodex]
-command = "clodex"
-args = ["mcp-server"]
-"""
+def codex_mcp_block(entry: dict[str, Any] | None = None) -> str:
+    entry = entry or clodex_mcp_server_entry()
+    # JSON string escaping is valid TOML basic-string escaping (Windows paths, quotes, unicode).
+    return f"[mcp_servers.clodex]\ncommand = {json.dumps(entry['command'])}\nargs = {json.dumps(entry['args'])}\n"
 
 
-def render_codex_toml(existing: str, *, force: bool = False) -> str:
+def render_codex_toml(existing: str, *, force: bool = False, entry: dict[str, Any] | None = None) -> str:
+    entry = entry or clodex_mcp_server_entry()
     has_unmanaged_clodex_table = _has_unmanaged_codex_mcp_table(existing)
     if existing.strip():
         try:
@@ -182,28 +180,28 @@ def render_codex_toml(existing: str, *, force: bool = False) -> str:
         if not force:
             raise ManagedBlockError(f".codex/config.toml already contains unmanaged [{CODEX_MCP_TABLE}]")
         existing = _remove_unmanaged_codex_mcp_tables(existing)
-    rendered = replace_toml_managed_block(existing, codex_mcp_block(), force=force)[0]
-    _validate_rendered_codex_toml(rendered)
+    rendered = replace_toml_managed_block(existing, codex_mcp_block(entry), force=force)[0]
+    _validate_rendered_codex_toml(rendered, entry)
     return rendered
 
 
-def _validate_rendered_codex_toml(rendered: str) -> None:
+def _validate_rendered_codex_toml(rendered: str, entry: dict[str, Any]) -> None:
     try:
         data = tomllib.loads(rendered)
     except tomllib.TOMLDecodeError as exc:
         raise ManagedBlockError(f"Rendered .codex/config.toml is invalid: {exc}") from exc
-    if not _has_clodex_mcp_command(data):
+    if not _has_clodex_mcp_command(data, entry):
         raise ManagedBlockError(f"Rendered .codex/config.toml is missing [{CODEX_MCP_TABLE}] command")
 
 
-def _has_clodex_mcp_command(data: Any) -> bool:
+def _has_clodex_mcp_command(data: Any, entry: dict[str, Any]) -> bool:
     if not isinstance(data, dict):
         return False
     servers = data.get("mcp_servers")
     if not isinstance(servers, dict):
         return False
     clodex = servers.get("clodex")
-    return isinstance(clodex, dict) and clodex.get("command") == "clodex"
+    return isinstance(clodex, dict) and clodex.get("command") == entry["command"] and clodex.get("args") == entry["args"]
 
 
 def build_clodex_policy_block() -> str:
@@ -234,6 +232,71 @@ def repo_native_targets(repo_root: Path, *, no_mcp_config: bool = False) -> list
     return targets
 
 
+def _claude_config_dir() -> Path:
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(override) if override else Path.home() / ".claude"
+
+
+def _claude_user_json() -> Path:
+    """Claude Code keeps user-scope MCP servers in ~/.claude.json (or $CLAUDE_CONFIG_DIR/.claude.json)."""
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (Path(override) if override else Path.home()) / ".claude.json"
+
+
+def _codex_home() -> Path:
+    override = os.environ.get("CODEX_HOME")
+    return Path(override) if override else Path.home() / ".codex"
+
+
+def native_targets(root: Path, *, global_mode: bool = False, no_mcp_config: bool = False) -> list[tuple[Path, str, str]]:
+    """The files `init` manages. Global mode writes where each agent actually looks for user-level files."""
+    if not global_mode:
+        return repo_native_targets(root, no_mcp_config=no_mcp_config)
+    targets = [
+        (_claude_config_dir() / "CLAUDE.md", "managed", build_claude_block()),
+        (_codex_home() / "AGENTS.md", "managed", build_agents_block()),
+    ]
+    if not no_mcp_config:
+        targets.append((_codex_home() / "config.toml", "toml", ""))
+    return targets
+
+
+def claude_user_mcp_commands() -> list[list[str]]:
+    """Register the server in Claude Code's user scope via its CLI (it owns ~/.claude.json).
+
+    `claude mcp add-json` keeps an existing server of the same name untouched, so remove first.
+    """
+    entry = clodex_mcp_server_entry(portable=False)
+    return [
+        ["claude", "mcp", "remove", "clodex", "--scope", "user"],
+        ["claude", "mcp", "add-json", "clodex", json.dumps({"type": "stdio", **entry}), "--scope", "user"],
+    ]
+
+
+def register_claude_user_mcp(runner: Any = subprocess.run, which: Any = shutil.which) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for argv in claude_user_mcp_commands():
+        shown = " ".join(argv[:5]) + (" ..." if len(argv) > 5 else "")
+        if not which("claude"):
+            results.append({"command": shown, "skipped": "the claude CLI is not on PATH; run this command yourself"})
+            continue
+        completed = runner(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, check=False)
+        results.append({"command": shown, "returncode": completed.returncode})
+    return results
+
+
+def claude_user_mcp_status() -> dict[str, Any]:
+    path = _claude_user_json()
+    try:
+        servers = json.loads(path.read_text(encoding="utf-8")).get("mcpServers") or {}
+    except (OSError, ValueError, AttributeError):
+        return {"path": str(path), "registered": False}
+    entry = servers.get("clodex") if isinstance(servers, dict) else None
+    expected = clodex_mcp_server_entry(portable=False)
+    matches = isinstance(entry, dict) and entry.get("command") == expected["command"] and entry.get("args") == expected["args"]
+    return {"path": str(path), "registered": isinstance(entry, dict), "current": bool(matches)}
+
+
 def target_status(path: Path, desired: str) -> str:
     if not path.exists():
         return "missing"
@@ -244,14 +307,15 @@ def target_status(path: Path, desired: str) -> str:
     return "current" if current == desired else "stale"
 
 
-def _planned_content(path: Path, kind: str, body: str, *, force: bool) -> str:
+def _planned_content(path: Path, kind: str, body: str, *, force: bool, portable: bool = True) -> str:
     existing = _read_text_preserve_newlines(path) if path.exists() else ""
+    entry = clodex_mcp_server_entry(portable=portable)
     if kind == "managed":
         return replace_managed_block(existing, body, force=force)[0]
     if kind == "json":
-        return render_mcp_json(existing, force=force)
+        return render_mcp_json(existing, force=force, entry=entry)
     if kind == "toml":
-        return render_codex_toml(existing, force=force)
+        return render_codex_toml(existing, force=force, entry=entry)
     raise ValueError(f"unknown native target kind: {kind}")
 
 
@@ -265,9 +329,10 @@ def plan_native_install(
 ) -> dict[str, Any]:
     target_root = Path.home() if global_mode else repo_root
     files: list[dict[str, Any]] = []
-    for path, kind, body in repo_native_targets(target_root, no_mcp_config=no_mcp_config):
+    for path, kind, body in native_targets(target_root, global_mode=global_mode, no_mcp_config=no_mcp_config):
         try:
-            content = _planned_content(path, kind, body, force=force)
+            # Shared repo files stay portable; user-level files may hold machine-specific absolute paths.
+            content = _planned_content(path, kind, body, force=force, portable=not global_mode)
         except UnicodeDecodeError as exc:
             files.append(
                 {
@@ -317,11 +382,13 @@ def plan_native_install(
             }
         )
     _mark_preflight_conflicts(files, files)
+    commands = [" ".join(argv[:5]) + (" ..." if len(argv) > 5 else "") for argv in claude_user_mcp_commands()] if global_mode and not no_mcp_config else []
     return {
         "mode": "global" if global_mode else "repo",
         "dry_run": dry_run,
         "root": str(target_root),
         "files": files,
+        "commands": commands,
     }
 
 
@@ -351,6 +418,8 @@ def apply_native_install(
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8", newline="") as handle:
             handle.write(item["preview"])
+    if plan["commands"]:
+        plan["commands_run"] = register_claude_user_mcp()
     return plan
 
 
@@ -370,12 +439,15 @@ def native_status(
     )
     files = [_status_entry(item) for item in plan["files"]]
     ok = all(item["status"] == "current" and item["action"] == "unchanged" for item in files)
-    return {
+    status: dict[str, Any] = {
         "ok": ok,
         "mode": plan["mode"],
         "root": plan["root"],
         "files": files,
     }
+    if global_mode and not no_mcp_config:
+        status["claude_user_mcp"] = claude_user_mcp_status()
+    return status
 
 
 def native_doctor(
@@ -643,10 +715,6 @@ def _is_codex_mcp_table_header(line: str) -> bool:
 
 def _is_codex_mcp_table_path(parts: list[str]) -> bool:
     return parts[:2] == ["mcp_servers", "clodex"]
-
-
-def _is_toml_table_header(line: str) -> bool:
-    return _toml_table_parts(line) is not None
 
 
 def _toml_table_parts(line: str) -> list[str] | None:
