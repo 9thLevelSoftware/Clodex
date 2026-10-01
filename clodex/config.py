@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import sys
-from datetime import date
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .models import retirement
 
 try:
     import yaml
@@ -64,26 +66,17 @@ class ConfigError(ValueError):
     """CLODEX.md could not be loaded."""
 
 
-# Codex models being retired: model -> (retire date, successor). A fuller
-# registry replaces this once model validation lands.
-RETIRING_CODEX_MODELS: dict[str, tuple[str, str]] = {
-    "gpt-5.5": ("2026-10-14", "gpt-6.1-sol"),
-}
 _warned_models: set[str] = set()
 
 
 def warn_if_model_retiring(model: str) -> None:
-    entry = RETIRING_CODEX_MODELS.get(model)
-    if entry is None or model in _warned_models:
+    info = retirement(model)
+    if info is None or model in _warned_models:
         return
     _warned_models.add(model)
-    retire_on, successor = entry
-    verb = "has retired" if date.today() >= date.fromisoformat(retire_on) else "retires"
-    print(
-        f"clodex: warning: Codex model '{model}' {verb} on {retire_on}. "
-        f"Set `model: {successor}` under `codex:` in the CLODEX.md front matter.",
-        file=sys.stderr,
-    )
+    verb = "has retired" if info.retired else "retires"
+    fix = f" Set `model: {info.successor}` under `codex:` in the CLODEX.md front matter (or run `clodex init --migrate`)." if info.successor else ""
+    print(f"clodex: warning: Codex model '{model}' {verb} on {info.on.isoformat()}.{fix}", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -161,6 +154,20 @@ class ClodexConfig:
         return dict(DEFAULT_CONFIG["tracing"] | self.raw.get("tracing", {}))
 
 
+def resolve_repo_root() -> Path:
+    """The repo Clodex should work on.
+
+    $CLODEX_REPO_ROOT wins. Claude Code sets $CLAUDE_PROJECT_DIR for the MCP servers and hooks it
+    starts, which matters because user-scope servers run with ~/.claude as their cwd. Otherwise
+    use the git root above the current directory.
+    """
+    for variable in ("CLODEX_REPO_ROOT", "CLAUDE_PROJECT_DIR"):
+        override = os.environ.get(variable)
+        if override and Path(override).is_dir():
+            return find_repo_root(Path(override))
+    return find_repo_root()
+
+
 def find_repo_root(start: Path | None = None) -> Path:
     current = (start or Path.cwd()).resolve()
     for candidate in [current, *current.parents]:
@@ -180,6 +187,9 @@ def load_config(repo_root: Path | None = None) -> ClodexConfig:
     parsed = parse_front_matter(front_matter, str(contract))
     merged = deep_merge(DEFAULT_CONFIG, parsed)
     warn_if_model_retiring(str(merged["codex"].get("model", "")))
+    audit_override = merged["codex"].get("audit")
+    if isinstance(audit_override, dict) and audit_override.get("model"):
+        warn_if_model_retiring(str(audit_override["model"]))
     return ClodexConfig(repo_root=root, raw=merged, prompt_body=body.strip(), user=parsed)
 
 

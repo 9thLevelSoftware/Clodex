@@ -10,6 +10,11 @@ from typing import Any
 
 TERMINAL_STATUSES = {"approved", "blocked", "failed", "cancelled", "applied", "completed"}
 HANDOFF_REASON_STATUSES = {"blocked", "failed"}
+HANDOFF_ACTORS = ("claude", "codex")
+MESSAGE_STATUSES = {"open", "answered", "delivered"}
+DELEGATION_MODES = {"implement", "fix", "audit"}
+DELEGATION_ACTIVE = {"queued", "running"}
+DELEGATION_FINISHED = {"completed", "failed", "cancelled"}
 HANDOFF_PHASES = {"planning", "implementation", "audit", "fix", "decision", "done"}
 HANDOFF_ACTIVE_STATUSES = {"handoff"} | HANDOFF_REASON_STATUSES
 # A finished run stays finished, except that it can then be applied (an approved run
@@ -25,6 +30,14 @@ def now_iso() -> str:
 
 def _int_or_default(value: Any, default: int) -> int:
     return default if value is None else int(value)
+
+
+def normalize_actor(value: Any, what: str = "actor") -> str:
+    """`claude` or `codex` (case-insensitive); anything else is rejected rather than silently recorded."""
+    actor = str(value).strip().lower() if value is not None else ""
+    if actor not in HANDOFF_ACTORS:
+        raise ValueError(f"unknown {what}: {value!r} (use claude or codex)")
+    return actor
 
 
 def _reason_text(value: Any) -> str | None:
@@ -126,6 +139,22 @@ class StateStore:
                     created_at text not null,
                     released_at text
                 );
+                create table if not exists delegations (
+                    id integer primary key autoincrement,
+                    run_id text not null,
+                    mode text not null,
+                    instructions text,
+                    approval_profile text,
+                    status text not null,
+                    pid integer,
+                    error text,
+                    summary text,
+                    diff_hash text,
+                    created_at text not null,
+                    started_at text,
+                    finished_at text,
+                    heartbeat_at text
+                );
                 create table if not exists cancellations (
                     run_id text primary key,
                     requested integer not null,
@@ -135,12 +164,13 @@ class StateStore:
                 """
             )
             self._ensure_run_columns(con)
+            self._ensure_message_columns(con)
             current = con.execute("select version from schema_version order by version desc limit 1").fetchone()
             if current is None:
-                con.execute("insert into schema_version(version) values (2)")
-            elif int(current["version"]) < 2:
+                con.execute("insert into schema_version(version) values (4)")
+            elif int(current["version"]) < 4:
                 con.execute("delete from schema_version")
-                con.execute("insert into schema_version(version) values (2)")
+                con.execute("insert into schema_version(version) values (4)")
 
     def _ensure_run_columns(self, con: sqlite3.Connection) -> None:
         existing = {row["name"] for row in con.execute("pragma table_info(runs)")}
@@ -162,6 +192,14 @@ class StateStore:
         for name, kind in columns.items():
             if name not in existing:
                 con.execute(f"alter table runs add column {name} {kind}")
+
+    def _ensure_message_columns(self, con: sqlite3.Connection) -> None:
+        """v4: messages grow from free-form notes into the clarification channel of a handoff."""
+        existing = {row["name"] for row in con.execute("pragma table_info(messages)")}
+        columns = {"run_id": "text", "actor": "text", "kind": "text", "reply_to": "integer", "status": "text"}
+        for name, kind in columns.items():
+            if name not in existing:
+                con.execute(f"alter table messages add column {name} {kind}")
 
     def table_names(self) -> set[str]:
         with self.session() as con:
@@ -262,21 +300,33 @@ class StateStore:
         phase: str = "planning",
         handoff_budget: int = 6,
         task_id: str | None = None,
+        workspace_path: str | None = None,
     ) -> dict[str, Any]:
         if handoff_budget < 0:
             raise ValueError("handoff_budget must be non-negative")
+        if phase not in HANDOFF_PHASES:
+            raise ValueError(f"unknown handoff phase: {phase} (use one of {sorted(HANDOFF_PHASES)})")
+        owner = normalize_actor(owner, "owner")
 
         timestamp = now_iso()
+        task_id = task_id or run_id  # every handoff shows up in the task ledger (`clodex status`)
         with self.session() as con:
             con.execute(
                 """
                 insert into runs(
                     id, task_id, status, prompt, owner, phase, handoff_count,
-                    handoff_budget, created_at, updated_at, started_at
+                    handoff_budget, workspace_path, created_at, updated_at, started_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, task_id, "handoff", prompt, owner, phase, 0, handoff_budget, timestamp, timestamp, timestamp),
+                (run_id, task_id, "handoff", prompt, owner, phase, 0, handoff_budget, workspace_path, timestamp, timestamp, timestamp),
+            )
+            con.execute(
+                """
+                insert into tasks(id, title, status, created_at, updated_at) values (?, ?, ?, ?, ?)
+                on conflict(id) do update set status=excluded.status, updated_at=excluded.updated_at
+                """,
+                (task_id, prompt.strip().splitlines()[0][:200] if prompt.strip() else run_id, "handoff", timestamp, timestamp),
             )
             self._insert_event(
                 con,
@@ -307,6 +357,8 @@ class StateStore:
             raise ValueError(f"unknown handoff status: {status} (use one of {sorted(HANDOFF_ACTIVE_STATUSES)})")
         if phase is not None and phase not in HANDOFF_PHASES:
             raise ValueError(f"unknown handoff phase: {phase} (use one of {sorted(HANDOFF_PHASES)})")
+        actor = normalize_actor(actor) if actor is not None else None
+        owner = normalize_actor(owner, "owner") if owner is not None else None
 
         with self.session() as con:
             con.execute("begin immediate")
@@ -369,6 +421,8 @@ class StateStore:
 
             updated = con.execute("select * from runs where id=?", (run_id,)).fetchone()
             updated_run = dict(updated)
+            self._record_report(con, run_id, actor, report, diff_hash, timestamp)
+            self._sync_task(con, updated_run, timestamp)
             updated_count = _int_or_default(updated_run.get("handoff_count"), 0)
             updated_budget = _int_or_default(updated_run.get("handoff_budget"), 6)
             event_data: dict[str, Any] = {
@@ -430,7 +484,43 @@ class StateStore:
                 timestamp,
             )
             updated = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+            self._sync_task(con, dict(updated), timestamp)
             return dict(updated)
+
+    # Run status -> task status for the ledger; handoff runs in flight leave the task alone.
+    _TASK_STATUS = {"approved": "done", "applied": "done", "completed": "done", "blocked": "blocked", "failed": "failed", "cancelled": "cancelled"}
+
+    def _sync_task(self, con: sqlite3.Connection, run: dict[str, Any], timestamp: str) -> None:
+        task_status = self._TASK_STATUS.get(str(run.get("status")))
+        if task_status and run.get("task_id"):
+            con.execute("update tasks set status=?, updated_at=? where id=?", (task_status, timestamp, run["task_id"]))
+
+    def _record_report(self, con: sqlite3.Connection, run_id: str, actor: str | None, report: dict[str, Any] | None, diff_hash: str | None, timestamp: str) -> None:
+        """Put what a handoff report says into the same ledger the classic workflow uses.
+
+        A verdict (`approved` true/false) becomes an `audits` row, and `artifacts` entries (paths or
+        {name, path, kind}) become `artifacts` rows, so `status`, exports and the MCP tools see them.
+        """
+        if not isinstance(report, dict):
+            return
+        if isinstance(report.get("approved"), bool):
+            agent = str(report.get("reviewer_id") or actor or "unknown")
+            con.execute(
+                "insert into audits(run_id, agent, approved, diff_hash, verdict_json, created_at) values (?, ?, ?, ?, ?, ?)",
+                (run_id, agent, int(report["approved"]), diff_hash or report.get("diff_hash"), json.dumps(report, default=str), timestamp),
+            )
+        artifacts = report.get("artifacts")
+        for item in artifacts if isinstance(artifacts, list) else []:
+            path = item.get("path") if isinstance(item, dict) else item
+            if not isinstance(path, str) or not path.strip():
+                continue
+            name = str(item.get("name")) if isinstance(item, dict) and item.get("name") else Path(path).name
+            kind = str(item.get("kind")) if isinstance(item, dict) and item.get("kind") else (Path(path).suffix.lstrip(".") or "file")
+            con.execute("delete from artifacts where run_id=? and name=?", (run_id, name))
+            con.execute(
+                "insert into artifacts(run_id, name, path, kind, created_at) values (?, ?, ?, ?, ?)",
+                (run_id, name, path, kind, timestamp),
+            )
 
     def get_handoff(self, run_id: str) -> dict[str, Any] | None:
         with self.session() as con:
@@ -451,6 +541,8 @@ class StateStore:
                 events.append(event)
 
             artifacts = [dict(artifact) for artifact in con.execute("select * from artifacts where run_id=? order by id", (run_id,))]
+            delegations = [dict(item) for item in con.execute("select * from delegations where run_id=? order by id desc limit 5", (run_id,))]
+            open_clarifications = [dict(item) for item in con.execute("select * from messages where run_id=? and kind='clarification' and status='open' order by id", (run_id,))]
             handoff_count = _int_or_default(run.get("handoff_count"), 0)
             handoff_budget = _int_or_default(run.get("handoff_budget"), 6)
             last_actor = run.get("last_actor")
@@ -460,10 +552,16 @@ class StateStore:
                 next_expected_actor = "claude"
             else:
                 next_expected_actor = run.get("owner") or "claude"
+            if open_clarifications:
+                # An open question hands the turn to whoever has to answer it.
+                asker = open_clarifications[-1].get("actor")
+                next_expected_actor = "claude" if asker == "codex" else "codex" if asker == "claude" else next_expected_actor
             return {
                 "run": run,
                 "events": events,
                 "artifacts": artifacts,
+                "delegations": delegations,
+                "open_clarifications": open_clarifications,
                 "budget_remaining": max(handoff_budget - handoff_count, 0),
                 "next_expected_actor": next_expected_actor,
             }
@@ -484,6 +582,89 @@ class StateStore:
                 "insert into messages(task_id, topic, body, created_at) values (?, ?, ?, ?)",
                 (task_id, topic, body, now_iso()),
             )
+
+    # ------------------------------------------------------------ clarifications
+    # Codex (or Claude) asks a question about a handoff; the other side answers; answers reach the
+    # next delegation. status: open -> answered -> delivered (included in a delegation's prompt).
+
+    def _live_handoff(self, con: sqlite3.Connection, run_id: str) -> dict[str, Any]:
+        row = con.execute("select * from runs where id=?", (run_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown run: {run_id}")
+        if str(row["status"]) in TERMINAL_STATUSES:
+            raise ValueError(f"the handoff is {row['status']}; it cannot take new messages")
+        return dict(row)
+
+    def add_clarification(self, run_id: str, actor: str, question: str) -> dict[str, Any]:
+        actor = normalize_actor(actor)
+        text = _reason_text(question)
+        if text is None:
+            raise ValueError("a clarification needs a question")
+        timestamp = now_iso()
+        with self.session() as con:
+            con.execute("begin immediate")
+            run = self._live_handoff(con, run_id)
+            cursor = con.execute(
+                "insert into messages(task_id, topic, body, created_at, run_id, actor, kind, status) values (?, ?, ?, ?, ?, ?, 'clarification', 'open')",
+                (run.get("task_id"), "clarification", text, timestamp, run_id, actor),
+            )
+            self._insert_event(con, run_id, "handoff.clarify", {"message_id": cursor.lastrowid, "actor": actor, "question": text}, timestamp)
+            return dict(con.execute("select * from messages where id=?", (cursor.lastrowid,)).fetchone())
+
+    def answer_clarification(self, run_id: str, message_id: int, answer: str, actor: str) -> dict[str, Any]:
+        actor = normalize_actor(actor)
+        text = _reason_text(answer)
+        if text is None:
+            raise ValueError("an answer cannot be empty")
+        timestamp = now_iso()
+        with self.session() as con:
+            con.execute("begin immediate")
+            run = self._live_handoff(con, run_id)
+            question = con.execute("select * from messages where id=? and run_id=? and kind='clarification'", (message_id, run_id)).fetchone()
+            if question is None:
+                raise ValueError(f"unknown clarification {message_id} for this handoff")
+            if question["status"] != "open":
+                raise ValueError(f"clarification {message_id} was already answered")
+            if question["actor"] == actor:
+                raise ValueError(f"clarification {message_id} was asked by {actor}; the other agent answers it")
+            cursor = con.execute(
+                "insert into messages(task_id, topic, body, created_at, run_id, actor, kind, reply_to, status) values (?, ?, ?, ?, ?, ?, 'answer', ?, 'final')",
+                (run.get("task_id"), "answer", text, timestamp, run_id, actor, message_id),
+            )
+            con.execute("update messages set status='answered' where id=?", (message_id,))
+            self._insert_event(con, run_id, "handoff.answer", {"message_id": message_id, "answer_id": cursor.lastrowid, "actor": actor, "answer": text}, timestamp)
+            return dict(con.execute("select * from messages where id=?", (cursor.lastrowid,)).fetchone())
+
+    def list_messages(self, run_id: str, status: str | None = None, kind: str | None = None) -> list[dict[str, Any]]:
+        if status is not None and status not in MESSAGE_STATUSES | {"final"}:
+            raise ValueError(f"unknown message status: {status} (use one of {sorted(MESSAGE_STATUSES)})")
+        clauses, params = ["run_id=?"], [run_id]
+        if status is not None:
+            clauses.append("status=?")
+            params.append(status)
+        if kind is not None:
+            clauses.append("kind=?")
+            params.append(kind)
+        with self.session() as con:
+            return [dict(row) for row in con.execute(f"select * from messages where {' and '.join(clauses)} order by id", params)]
+
+    def answered_clarifications(self, run_id: str) -> list[dict[str, Any]]:
+        """Question/answer pairs the next delegation has not been told about yet."""
+        with self.session() as con:
+            rows = con.execute(
+                """
+                select q.id as id, q.body as question, a.body as answer, q.actor as asked_by, a.actor as answered_by
+                from messages q join messages a on a.reply_to = q.id and a.kind = 'answer'
+                where q.run_id=? and q.kind='clarification' and q.status='answered' order by q.id
+                """,
+                (run_id,),
+            )
+            return [dict(row) for row in rows]
+
+    def mark_delivered(self, message_ids: list[int]) -> None:
+        with self.session() as con:
+            for message_id in message_ids:
+                con.execute("update messages set status='delivered' where id=? and kind='clarification' and status='answered'", (message_id,))
 
     def add_event(self, run_id: str, event: str, data: dict[str, Any]) -> None:
         with self.session() as con:
@@ -527,6 +708,67 @@ class StateStore:
                 (now_iso(), run_id, *sorted(TERMINAL_STATUSES)),
             )
 
+    # ------------------------------------------------------------ delegations
+    # A delegation is one Codex job a handoff asked for (implement / fix / audit).
+
+    def start_delegation(self, run_id: str, mode: str, instructions: str | None = None, approval_profile: str | None = None) -> dict[str, Any]:
+        """Record a new delegation unless one is already active for this handoff (atomic)."""
+        if mode not in DELEGATION_MODES:
+            raise ValueError(f"unknown delegation mode: {mode} (use one of {sorted(DELEGATION_MODES)})")
+        timestamp = now_iso()
+        with self.session() as con:
+            con.execute("begin immediate")
+            marks = ",".join("?" for _ in DELEGATION_ACTIVE)
+            active = con.execute(f"select id from delegations where run_id=? and status in ({marks})", (run_id, *sorted(DELEGATION_ACTIVE))).fetchone()
+            if active is not None:
+                raise ValueError(f"a delegation is already running for this handoff (delegation {active['id']})")
+            cursor = con.execute(
+                "insert into delegations(run_id, mode, instructions, approval_profile, status, created_at) values (?, ?, ?, ?, 'queued', ?)",
+                (run_id, mode, instructions, approval_profile, timestamp),
+            )
+            return dict(con.execute("select * from delegations where id=?", (cursor.lastrowid,)).fetchone())
+
+    _DELEGATION_FIELDS = {"status", "pid", "error", "summary", "diff_hash", "started_at", "finished_at"}
+
+    def update_delegation(self, delegation_id: int, **fields: Any) -> dict[str, Any]:
+        unknown = set(fields) - self._DELEGATION_FIELDS
+        if unknown:
+            raise ValueError(f"unknown delegation fields: {sorted(unknown)}")
+        if fields.get("status") in DELEGATION_FINISHED:
+            fields.setdefault("finished_at", now_iso())
+        with self.session() as con:
+            con.execute("begin immediate")
+            row = con.execute("select * from delegations where id=?", (delegation_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"unknown delegation: {delegation_id}")
+            if str(row["status"]) in DELEGATION_FINISHED and fields.get("status") not in (None, row["status"]):
+                return dict(row)  # a finished delegation stays finished (e.g. a worker that outlived a cancel)
+            if fields:
+                assignments = ", ".join(f"{name}=?" for name in fields)
+                con.execute(f"update delegations set {assignments} where id=?", (*fields.values(), delegation_id))
+            return dict(con.execute("select * from delegations where id=?", (delegation_id,)).fetchone())
+
+    def touch_delegation(self, delegation_id: int) -> None:
+        marks = ",".join("?" for _ in DELEGATION_ACTIVE)
+        with self.session() as con:
+            con.execute(f"update delegations set heartbeat_at=? where id=? and status in ({marks})", (now_iso(), delegation_id, *sorted(DELEGATION_ACTIVE)))
+
+    def get_delegation(self, delegation_id: int) -> dict[str, Any] | None:
+        with self.session() as con:
+            row = con.execute("select * from delegations where id=?", (delegation_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_delegations(self, run_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        with self.session() as con:
+            rows = con.execute("select * from delegations where run_id=? order by id desc limit ?", (run_id, limit))
+            return [dict(row) for row in rows]
+
+    def active_delegation(self, run_id: str) -> dict[str, Any] | None:
+        marks = ",".join("?" for _ in DELEGATION_ACTIVE)
+        with self.session() as con:
+            row = con.execute(f"select * from delegations where run_id=? and status in ({marks}) order by id desc limit 1", (run_id, *sorted(DELEGATION_ACTIVE))).fetchone()
+            return dict(row) if row else None
+
     def release_workspace_lock(self, run_id: str) -> None:
         with self.session() as con:
             con.execute("update workspace_locks set released_at=? where run_id=? and released_at is null", (now_iso(), run_id))
@@ -568,6 +810,9 @@ class StateStore:
         with self.session() as con:
             return [dict(row) for row in con.execute("select * from tasks order by updated_at desc")]
 
-    def list_runs(self) -> list[dict[str, Any]]:
+    def list_runs(self, limit: int = 20, offset: int = 0, with_worker: bool = False) -> list[dict[str, Any]]:
+        """Newest first. `with_worker` keeps only runs started through a worker process (the MCP "tasks")."""
+        where = "where pid is not null" if with_worker else ""
         with self.session() as con:
-            return [dict(row) for row in con.execute("select * from runs order by updated_at desc limit 20")]
+            rows = con.execute(f"select * from runs {where} order by updated_at desc, id desc limit ? offset ?", (limit, offset))
+            return [dict(row) for row in rows]

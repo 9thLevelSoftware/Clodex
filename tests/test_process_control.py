@@ -49,6 +49,12 @@ class ProcessHelperTests(unittest.TestCase):
         self.assertFalse(pid_alive(0))
         self.assertFalse(pid_alive(finished_pid()))
 
+    def test_exited_but_unreaped_child_is_not_alive(self):
+        # On POSIX an exited child stays a zombie until its parent waits; it must not count as alive.
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        self.addCleanup(child.wait)
+        self.assertTrue(wait_for(lambda: not pid_alive(child.pid), 15), "zombie child reported alive")
+
     def test_kill_tree_stops_the_process_and_its_children(self):
         child_pid_file = Path(self.id() + ".pid")
         script = (

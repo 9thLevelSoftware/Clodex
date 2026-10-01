@@ -5,40 +5,27 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import UTC, datetime
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from .artifacts import ArtifactStore, make_run_id, make_task_id
 from .config import ClodexConfig, load_config
-from .procs import kill_tree, pid_alive, popen_isolation_kwargs
+from .models import ensure_usable
+from .delegate import cancel_active_delegation
+from .procs import HEARTBEAT_INTERVAL, kill_tree, popen_isolation_kwargs, worker_state as shared_worker_state
 from .state import TERMINAL_STATUSES, StateStore
 from .workflow import WorkflowResult
 from .workspace import WorkspaceManager
 
 ACTIVE_STATUSES = {"queued", "running", "planning", "auditing", "needs-fix", "cancel_requested"}
-HEARTBEAT_INTERVAL = 5.0
-# A live worker beats every few seconds; a pid with an older heartbeat is probably a
-# reused pid, so it is never signalled.
-STALE_AFTER = 60.0
-START_GRACE = 30.0
-
-
-def _parse_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
 
 
 class Heartbeat:
-    """Keeps `runs.heartbeat_at` fresh while a worker process is doing the run."""
+    """Keeps a worker's heartbeat fresh while it works (a run's by default, or whatever `beat` touches)."""
 
-    def __init__(self, state: StateStore, run_id: str, interval: float = HEARTBEAT_INTERVAL):
-        self.state = state
-        self.run_id = run_id
+    def __init__(self, state: StateStore, key: Any, interval: float = HEARTBEAT_INTERVAL, beat: Callable[[], None] | None = None):
+        self._beat_once = beat or (lambda: state.touch_run(key))
         self.interval = interval
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._beat, name="clodex-heartbeat", daemon=True)
@@ -46,7 +33,7 @@ class Heartbeat:
     def _beat(self) -> None:
         while True:
             try:
-                self.state.touch_run(self.run_id)
+                self._beat_once()
             except Exception:  # noqa: BLE001 - a missed beat must never kill the worker
                 pass
             if self._stop.wait(self.interval):
@@ -80,6 +67,8 @@ class TaskManager:
         approval_profile: str | None = None,
         dry_run: bool = False,
     ) -> WorkflowResult:
+        if not dry_run:
+            ensure_usable(self.config)
         task_id = make_task_id(task)
         run_id = make_run_id(task_id)
         selected_workspace = workspace_backend or self.config.workspace["backend"]
@@ -131,17 +120,7 @@ class TaskManager:
 
     def worker_state(self, run: dict[str, Any]) -> str:
         """`none` (no worker), `dead`, `stale` (alive pid but no recent heartbeat) or `alive`."""
-        pid = run.get("pid")
-        if not pid:
-            return "none"
-        if not pid_alive(int(pid)):
-            return "dead"
-        heartbeat = _parse_time(run.get("heartbeat_at"))
-        reference = heartbeat or _parse_time(run.get("started_at")) or _parse_time(run.get("created_at"))
-        limit = STALE_AFTER if heartbeat else START_GRACE
-        if reference is not None and (datetime.now(UTC) - reference).total_seconds() > limit:
-            return "stale"
-        return "alive"
+        return shared_worker_state(run.get("pid"), run.get("heartbeat_at"), run.get("started_at") or run.get("created_at"))
 
     def reconcile(self, run: dict[str, Any]) -> dict[str, Any]:
         """Notice a worker that died without finishing its run, instead of leaving it queued forever."""
@@ -181,6 +160,7 @@ class TaskManager:
         if self.worker_state(run) == "alive":
             kill_tree(int(run["pid"]))
             killed = True
+        delegation_stopped = cancel_active_delegation(self.state, run_id)
         self.state.complete_cancel(run_id)
         released = self._release_workspace(run)
         updated = self.state.get_run(run_id) or run
@@ -189,7 +169,7 @@ class TaskManager:
             run_id,
             updated.get("task_id"),
             updated.get("artifacts_dir"),
-            {"cancel_requested": True, "worker_stopped": killed, "workspace_released": released},
+            {"cancel_requested": True, "worker_stopped": killed or delegation_stopped, "workspace_released": released},
         )
 
     def _release_workspace(self, run: dict[str, Any]) -> bool:

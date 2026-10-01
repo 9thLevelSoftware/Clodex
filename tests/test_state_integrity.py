@@ -88,7 +88,9 @@ class CancelTests(StateCase):
 
 class HandoffValidationTests(StateCase):
     def test_unknown_phase_and_status_are_rejected_known_ones_accepted(self):
-        self.store.create_handoff("h1", "t", "prompt", "claude")
+        self.store.create_handoff("h1", "prompt", owner="claude")
+        with self.assertRaisesRegex(ValueError, "unknown handoff phase"):
+            self.store.create_handoff("h2", "prompt", phase="vibing")
         for phase in sorted(HANDOFF_PHASES):
             self.assertEqual(self.store.update_handoff("h1", phase=phase)["phase"], phase)
         with self.assertRaisesRegex(ValueError, "unknown handoff phase"):

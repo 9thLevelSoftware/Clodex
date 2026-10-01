@@ -25,6 +25,18 @@ def cli_test_python() -> str | None:
     return None
 
 
+FAKE_CODEX_CATALOG = {
+    "models": [
+        {"slug": "gpt-6.1-sol", "visibility": "list", "default_reasoning_level": "low",
+         "supported_reasoning_levels": [{"effort": e} for e in ("low", "medium", "high", "xhigh", "max", "ultra")]},
+        {"slug": "gpt-6-luna", "visibility": "list", "default_reasoning_level": "medium",
+         "supported_reasoning_levels": [{"effort": e} for e in ("low", "medium", "high", "xhigh", "max")]},
+        {"slug": "gpt-5.5", "visibility": "list", "default_reasoning_level": "medium",
+         "supported_reasoning_levels": [{"effort": e} for e in ("low", "medium", "high", "xhigh")]},
+    ]
+}
+
+
 def cleanup_tempdir(tmp: tempfile.TemporaryDirectory, attempts: int = 50) -> None:
     # Orphaned fake CLI children can briefly hold the directory on Windows.
     for attempt in range(attempts):
@@ -67,6 +79,12 @@ class FakeCliPath:
         fail_reviewers: tuple[str, ...] = (),
         slow_reviewers: tuple[str, ...] = (),
         reject_reviewers: tuple[str, ...] = (),
+        help_lacks: tuple[str, ...] = (),
+        claude_logged_in: bool = True,
+        codex_logged_in: bool = True,
+        codex_catalog: dict | None = None,
+        codex_fails: bool = False,
+        codex_clarifies: bool = False,
     ):
         self.reject_once = reject_once
         self.malformed_once = malformed_once
@@ -76,6 +94,12 @@ class FakeCliPath:
         self.fail_reviewers = tuple(fail_reviewers)
         self.slow_reviewers = tuple(slow_reviewers)
         self.reject_reviewers = tuple(reject_reviewers)
+        self.help_lacks = tuple(help_lacks)
+        self.claude_logged_in = claude_logged_in
+        self.codex_logged_in = codex_logged_in
+        self.codex_catalog = codex_catalog
+        self.codex_fails = codex_fails
+        self.codex_clarifies = codex_clarifies
         self.sleep_seconds = sleep_seconds
         self.include_clodex = include_clodex
 
@@ -113,6 +137,31 @@ args = sys.argv[2:]
 if '--version' in args:
     # Answer before reading stdin: callers like `doctor` don't close it.
     print(name + ' fake 1.0.0')
+    raise SystemExit(0)
+CLAUDE_HELP_FLAGS = ['--model', '--effort', '--permission-mode', '--output-format', '--json-schema', '--fallback-model', '--max-budget-usd']
+CODEX_HELP_FLAGS = ['--sandbox', '--model', '--cd', '--output-schema', '--output-last-message', '--approve-for-me', '--ephemeral']
+LACKS = {self.help_lacks!r}
+if '--help' in args:
+    flags = CLAUDE_HELP_FLAGS if name == 'claude' else CODEX_HELP_FLAGS
+    print('Usage: ' + name + ' [options]')
+    for flag in flags:
+        if flag not in LACKS:
+            print('  ' + flag + ' <value>   fake option')
+    raise SystemExit(0)
+if name == 'claude' and args[:2] == ['auth', 'status']:
+    print(json.dumps({{'loggedIn': {self.claude_logged_in!r}, 'authMethod': 'fake'}}))
+    raise SystemExit(0)
+if name == 'codex' and args[:2] == ['login', 'status']:
+    if {self.codex_logged_in!r}:
+        print('Logged in using fake')
+        raise SystemExit(0)
+    print('Not logged in')
+    raise SystemExit(1)
+if name == 'codex' and args[:2] == ['debug', 'models']:
+    if {self.codex_catalog!r} is None:
+        sys.stderr.write('error: unrecognized subcommand\\n')
+        raise SystemExit(2)
+    print(json.dumps({self.codex_catalog!r}))
     raise SystemExit(0)
 stdin = sys.stdin.read()
 
@@ -262,6 +311,9 @@ if name == 'codex':
         fail('error: invalid sandbox ' + sandbox)
     if '-C' in flags:
         os.chdir(flags['-C'][-1])
+    if {self.codex_fails!r} and 'adversarial auditor' not in stdin:
+        sys.stderr.write('simulated codex crash\\n')
+        raise SystemExit(5)
 
     def finish(text):
         out = flags.get('-o') or flags.get('--output-last-message')
@@ -270,6 +322,9 @@ if name == 'codex':
         print(text)
         raise SystemExit(0)
 
+    if {self.codex_clarifies!r} and 'adversarial auditor' not in stdin and 'Clarifications from Claude' not in stdin:
+        # Ask instead of guessing, until the answers show up in the prompt.
+        finish('I cannot proceed without a decision.\\n\\n' + json.dumps({{'clarifications': ['Which database should be used?', {{'question': 'Must it stay backwards compatible?'}}]}}))
     if 'adversarial auditor' in stdin:
         finish(audit_verdict(True, 'ok', []))
     if 'Required fixes' in stdin:

@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
+from .config import ConfigError, resolve_repo_root
+from .delegate import run_delegation
 from .doctor import run_doctor
 from .evals import run_local_evals
-from .hooks import hook_config, ingest_hook_event
+from .hooks import derive_run_id, hook_config, ingest_hook_event, install_hooks, parse_hook_payload
 from .mcp_server import main as mcp_main
+from .migrate import migrate_contract
+from .models import ModelRetiredError
 from .native import (
     ManagedBlockError,
     apply_native_install,
@@ -22,17 +27,47 @@ from .workflow import ClodexWorkflow
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except (ConfigError, ModelRetiredError, ValueError) as exc:
+        if os.environ.get("CLODEX_DEBUG"):
+            raise
+        # Deliberate user-facing errors (unknown run id, bad ref, bad config): one line, no traceback.
+        print(f"clodex: error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+
+def handle_migrate(args: argparse.Namespace) -> int:
+    contract = resolve_repo_root() / "CLODEX.md"
+    if not contract.is_file():
+        print_output({"ok": False, "error": f"{contract} not found"}, args.json)
+        return 1
+    with contract.open(encoding="utf-8", newline="") as handle:  # keep CRLF endings as they are
+        text = handle.read()
+    migrated, changes = migrate_contract(text, split_claude=args.split_claude)
+    written = bool(changes) and not args.dry_run
+    if written:
+        with contract.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(migrated)
+    print_output({"ok": True, "file": str(contract), "changes": changes, "dry_run": args.dry_run, "written": written}, args.json)
+    return 0
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="clodex", description="Claude Code + Codex CLI workflow orchestrator")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON where supported")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("doctor", help="Check local Clodex, Claude Code, Codex, and git readiness")
+    doctor = sub.add_parser("doctor", help="Check local Clodex, Claude Code, Codex, and git readiness")
+    doctor.add_argument("--strict", action="store_true", help="Treat warnings (e.g. a model retiring soon) as failures")
 
     init = sub.add_parser("init", help="Install native Claude Code and Codex collaboration instructions")
     init.add_argument("--global", action="store_true", dest="global_mode")
     init.add_argument("--dry-run", action="store_true")
     init.add_argument("--no-mcp-config", action="store_true")
     init.add_argument("--force", action="store_true")
+    init.add_argument("--migrate", action="store_true", help="Update CLODEX.md settings that no longer work (retired models, unsupported efforts)")
+    init.add_argument("--split-claude", action="store_true", help="With --migrate: split flat claude.model/effort into plan and audit roles")
 
     native = sub.add_parser("native", help="Inspect native Clodex setup")
     native_sub = native.add_subparsers(dest="native_command", required=True)
@@ -52,9 +87,12 @@ def main(argv: list[str] | None = None) -> int:
     build = sub.add_parser("build", help="Run plan, implementation, and dual audit")
     add_build_args(build)
 
-    audit = sub.add_parser("audit", help="Audit current uncommitted changes")
+    audit = sub.add_parser("audit", help="Audit current uncommitted changes, everything since a base ref, or one commit")
     audit.add_argument("--dry-run", action="store_true")
-    audit.add_argument("--diff", action="store_true", help="Accepted for compatibility; audit always uses git diff")
+    audit_target = audit.add_mutually_exclusive_group()
+    audit_target.add_argument("--diff", action="store_true", help="Audit the current uncommitted diff (the default)")
+    audit_target.add_argument("--base", metavar="REF", help="Audit everything since this ref diverged from HEAD, including uncommitted edits")
+    audit_target.add_argument("--commit", metavar="SHA", help="Audit the changes introduced by one commit")
 
     run = sub.add_parser("run", help="Alias for build")
     add_build_args(run)
@@ -75,6 +113,10 @@ def main(argv: list[str] | None = None) -> int:
     task_worker.add_argument("run_id")
     task_worker.add_argument("--workspace", choices=["git-worktree", "local"])
     task_worker.add_argument("--approval-profile", choices=["ci", "local", "auto_review"])
+    task_delegate = task_sub.add_parser("delegate-worker", help="Internal: run one delegated Codex job for a native handoff")
+    task_delegate.add_argument("run_id")
+    task_delegate.add_argument("delegation_id", type=int)
+    task_delegate.add_argument("--approval-profile", choices=["ci", "local", "auto_review"])
 
     queue = sub.add_parser("queue", help="Manage the local task ledger")
     queue_sub = queue.add_subparsers(dest="queue_command", required=True)
@@ -106,11 +148,15 @@ def main(argv: list[str] | None = None) -> int:
 
     hooks = sub.add_parser("hooks", help="Print or ingest Claude Code hook events")
     hooks_sub = hooks.add_subparsers(dest="hooks_command", required=True)
-    hooks_sub.add_parser("print")
-    hooks_install = hooks_sub.add_parser("install")
-    hooks_install.add_argument("--dry-run", action="store_true", required=True)
-    hooks_ingest = hooks_sub.add_parser("ingest")
-    hooks_ingest.add_argument("--run-id", default="manual-hook-event")
+    hooks_sub.add_parser("print", help="Print the hooks block for a Claude Code settings file")
+    for name, help_text in (("install", "Add Clodex's hooks to a Claude Code settings file"), ("uninstall", "Remove Clodex's hooks again")):
+        hooks_edit = hooks_sub.add_parser(name, help=help_text)
+        hooks_edit.add_argument("--scope", choices=["local", "project", "user"], default="local", help="local: .claude/settings.local.json (default), project: .claude/settings.json, user: ~/.claude/settings.json")
+        hooks_edit.add_argument("--dry-run", action="store_true")
+        hooks_edit.add_argument("--force", action="store_true", help="Replace a settings file that is not valid JSON")
+    hooks_ingest = hooks_sub.add_parser("ingest", help="Record one hook event from stdin (used by the installed hooks)")
+    hooks_ingest.add_argument("--run-id", default=None, help="Default: $CLODEX_RUN_ID, else the session id from the payload")
+    hooks_ingest.add_argument("--verbose", action="store_true", help="Print the result (hooks must stay silent: stdout can reach Claude's context)")
 
     sub.add_parser("status", help="Show recent tasks and runs")
     sub.add_parser("mcp-server", help="Run the Clodex MCP stdio server")
@@ -120,9 +166,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "mcp-server":
         return mcp_main()
     if args.command == "doctor":
-        exit_code, data = run_doctor()
+        exit_code, data = run_doctor(resolve_repo_root(), strict=args.strict)
         print_output(data, args.json)
         return exit_code
+    if args.command == "init" and args.migrate:
+        return handle_migrate(args)
     if args.command == "init":
         try:
             exit_code = 0
@@ -168,12 +216,13 @@ def main(argv: list[str] | None = None) -> int:
             print_output(data, args.json)
             return exit_code
 
-    workflow = ClodexWorkflow(Path.cwd())
+    repo = resolve_repo_root()
+    workflow = ClodexWorkflow(repo)
 
     if args.command == "plan":
         result = workflow.plan(" ".join(args.task), dry_run=args.dry_run)
         print_result(result.__dict__, args.json)
-        return 0
+        return exit_code_for(result.status)
     if args.command in {"build", "run"}:
         result = workflow.build(
             " ".join(args.task),
@@ -183,25 +232,25 @@ def main(argv: list[str] | None = None) -> int:
             apply_changes=args.apply_changes,
         )
         print_result(result.__dict__, args.json)
-        return 0 if result.status not in {"blocked"} else 1
+        return exit_code_for(result.status)
     if args.command == "audit":
-        result = workflow.audit(dry_run=args.dry_run)
+        result = workflow.audit(dry_run=args.dry_run, base=args.base, commit=args.commit)
         print_result(result.__dict__, args.json)
-        return 0 if result.status not in {"blocked"} else 1
+        return exit_code_for(result.status)
     if args.command == "task":
         return handle_task(args, workflow, args.json)
     if args.command == "apply":
         result = workflow.apply_run(args.run_id, check=args.check, force=args.force)
         print_result(result.__dict__, args.json)
-        return 0 if result.status not in {"apply-failed", "apply-check-failed", "apply-refused"} else 1
+        return exit_code_for(result.status)
     if args.command == "clean":
         result = workflow.clean_run(args.run_id)
         print_result(result.__dict__, args.json)
-        return 0 if result.status != "clean-refused" else 1
+        return exit_code_for(result.status)
     if args.command == "trace":
         return handle_trace(args, workflow, args.json)
     if args.command == "eval":
-        data = run_local_evals(Path.cwd())
+        data = run_local_evals(repo)
         print_output(data, args.json)
         return 0 if data["passed"] else 1
     if args.command == "hooks":
@@ -234,7 +283,7 @@ def add_build_args(parser: argparse.ArgumentParser) -> None:
 
 
 def handle_task(args: argparse.Namespace, workflow: ClodexWorkflow, as_json: bool) -> int:
-    manager = TaskManager(Path.cwd())
+    manager = TaskManager(resolve_repo_root())
     if args.task_command == "start":
         result = manager.start(" ".join(args.task), workspace_backend=args.workspace, approval_profile=args.approval_profile, dry_run=args.dry_run)
         print_result(result.__dict__, as_json)
@@ -253,11 +302,17 @@ def handle_task(args: argparse.Namespace, workflow: ClodexWorkflow, as_json: boo
     if args.task_command == "list":
         print_output(manager.list(), as_json)
         return 0
+    if args.task_command == "delegate-worker":
+        delegation_id = args.delegation_id
+        with Heartbeat(workflow.state, delegation_id, beat=lambda: workflow.state.touch_delegation(delegation_id)):
+            delegation = run_delegation(resolve_repo_root(), args.run_id, delegation_id)
+        print_output(delegation, as_json)
+        return 0 if delegation.get("status") == "completed" else 1
     if args.task_command == "worker":
         with Heartbeat(workflow.state, args.run_id):
             result = workflow.run_existing(args.run_id, workspace_backend=args.workspace, approval_profile=args.approval_profile)
         print_result(result.__dict__, as_json)
-        return 0 if result.status not in {"blocked"} else 1
+        return exit_code_for(result.status)
     return 2
 
 
@@ -276,16 +331,44 @@ def handle_trace(args: argparse.Namespace, workflow: ClodexWorkflow, as_json: bo
 
 def handle_hooks(args: argparse.Namespace, as_json: bool) -> int:
     if args.hooks_command == "print":
-        print_output(hook_config(Path.cwd()), as_json)
+        print_output(hook_config(), as_json)
         return 0
-    if args.hooks_command == "install":
-        print_output({"dry_run": True, "config": hook_config(Path.cwd())}, as_json)
+    if args.hooks_command in {"install", "uninstall"}:
+        result = install_hooks(resolve_repo_root(), args.scope, dry_run=args.dry_run, remove=args.hooks_command == "uninstall", force=args.force)
+        print_output(result, as_json)
         return 0
     if args.hooks_command == "ingest":
-        payload = json.loads(sys.stdin.read() or "{}")
-        print_output(ingest_hook_event(Path.cwd(), args.run_id, payload), as_json)
+        # A hook that exits 2 blocks the action it is attached to, and its stdout can reach
+        # Claude's context: so never fail loudly, and stay silent unless asked.
+        try:
+            payload = parse_hook_payload(sys.stdin.read())
+            result = ingest_hook_event(resolve_repo_root(), derive_run_id(args.run_id, payload), payload)
+        except Exception as exc:  # noqa: BLE001
+            print(f"clodex hooks ingest: {exc}", file=sys.stderr)
+            return 1
+        if args.verbose or as_json:
+            print_output(result, as_json)
         return 0
     return 2
+
+
+# Exit codes: 0 success, 1 the work was refused or rejected (blocked, nothing applied),
+# 2 usage or configuration error, 3 failed unexpectedly, 4 cancelled.
+EXIT_BLOCKED = 1
+EXIT_USAGE = 2
+EXIT_FAILED = 3
+EXIT_CANCELLED = 4
+_BLOCKED_STATUSES = {"blocked", "apply-refused", "apply-failed", "apply-check-failed", "clean-refused"}
+
+
+def exit_code_for(status: str) -> int:
+    if status in _BLOCKED_STATUSES:
+        return EXIT_BLOCKED
+    if status == "failed":
+        return EXIT_FAILED
+    if status == "cancelled":
+        return EXIT_CANCELLED
+    return 0
 
 
 def print_result(data: dict[str, Any], as_json: bool) -> None:
@@ -306,5 +389,59 @@ def print_result(data: dict[str, Any], as_json: bool) -> None:
 def print_output(data: dict[str, Any], as_json: bool) -> None:
     if as_json:
         print(json.dumps(data, indent=2, sort_keys=True))
+    elif "diagnostics" in data and "python" in data:
+        print("\n".join(format_doctor(data)))
     else:
-        print(json.dumps(data, indent=2, sort_keys=True))
+        print("\n".join(format_human(data)) or "(nothing to show)")
+
+
+def _scalar(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def format_human(data: Any, indent: int = 0) -> list[str]:
+    """Plain-text rendering of nested dicts/lists for people (machine consumers use --json)."""
+    pad = "  " * indent
+    lines: list[str] = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, (dict, list)) and value:
+                lines.append(f"{pad}{key}:")
+                lines.extend(format_human(value, indent + 1))
+            else:
+                lines.append(f"{pad}{key}: {_scalar(value) if not isinstance(value, (dict, list)) else '(none)'}")
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                head = next((str(item[key]) for key in ("id", "name", "run_id", "taskId") if key in item), "")
+                lines.append(f"{pad}- {head}".rstrip())
+                lines.extend(format_human({k: v for k, v in item.items() if str(v) != head}, indent + 1))
+            else:
+                lines.append(f"{pad}- {_scalar(item)}")
+    else:
+        lines.append(f"{pad}{_scalar(data)}")
+    return lines
+
+
+def format_doctor(data: dict[str, Any]) -> list[str]:
+    def mark(ok: bool) -> str:
+        return "[ok]  " if ok else "[FAIL]"
+
+    lines = [f"{mark(data['python']['ok'])} python {data['python']['version']}", f"{mark(data['contract']['ok'])} CLODEX.md ({data['contract']['path']})"]
+    for name in ("git", "claude", "codex"):
+        info = data[name]
+        lines.append(f"{mark(info['ok'])} {name}: {info.get('version') or 'not found'}")
+    for name, auth in (data.get("auth") or {}).items():
+        lines.append(f"{mark(auth['status'] != 'logged-out')} {name} login: {auth['status']}")
+    for item in data["diagnostics"]:
+        tag = "[FAIL]" if item["level"] == "error" else "[warn]"
+        lines.append(f"{tag} {item['where']}: {item['message']}")
+        if item.get("fix"):
+            lines.append(f"       fix: {item['fix']}")
+    lines.append("")
+    lines.append("Everything looks good." if data["ok"] else "Problems found; see above.")
+    return lines

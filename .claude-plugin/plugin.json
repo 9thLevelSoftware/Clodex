@@ -2,14 +2,27 @@
   "name": "clodex",
   "version": "0.1.1",
   "description": "Claude Code and Codex CLI dual-agent workflow orchestration.",
-  "skills": {
-    "clodex-workflow": {
-      "path": "skills/clodex-workflow/SKILL.md"
-    }
+  "author": {
+    "name": "9thLevelSoftware",
+    "url": "https://github.com/9thLevelSoftware"
   },
-  "commands": {
-    "clodex-plan": "dist/.claude/commands/clodex/clodex-plan.md",
-    "clodex-build": "dist/.claude/commands/clodex/clodex-build.md",
-    "clodex-audit": "dist/.claude/commands/clodex/clodex-audit.md"
+  "homepage": "https://github.com/9thLevelSoftware/Clodex#readme",
+  "repository": "https://github.com/9thLevelSoftware/Clodex",
+  "keywords": [
+    "codex",
+    "mcp",
+    "agent-harness",
+    "workflow"
+  ],
+  "commands": [
+    "./dist/.claude/commands/clodex/"
+  ],
+  "mcpServers": {
+    "clodex": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/npm/clodex-mcp-server.js"
+      ]
+    }
   }
 }
