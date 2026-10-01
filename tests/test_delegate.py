@@ -349,7 +349,7 @@ class DelegationStateTests(unittest.TestCase):
             con.commit()
             con.close()
             store = StateStore(db)
-            self.assertEqual(store.schema_version(), 3)
+            self.assertEqual(store.schema_version(), 4)
             self.assertIn("delegations", store.table_names())
 
     def test_start_is_atomic_updates_are_sticky_and_listing_is_newest_first(self):

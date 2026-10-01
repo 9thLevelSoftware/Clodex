@@ -7,7 +7,9 @@ verdict) using the same state as every other handoff update.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -29,10 +31,39 @@ from .workspace import WorkspaceManager
 
 POLL_SECONDS = 0.5
 SUMMARY_LIMIT = 4000
+MAX_CLARIFICATIONS = 10
+_FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 
 class WaitAborted(Exception):
     """The caller stopped waiting (cancelled request or closed connection)."""
+
+
+def extract_clarifications(text: str) -> list[str]:
+    """Questions Codex asked instead of guessing: `{"clarifications": ["...", ...]}` in its final message.
+
+    Entries may be strings or `{"question": "..."}`. Anything else (including other JSON objects
+    in a report that quotes code) is ignored; at most MAX_CLARIFICATIONS are kept.
+    """
+    candidates = list(_FENCED_JSON.findall(text))
+    for match in re.finditer(r"\{", text):  # the last JSON object in the message, fenced or not
+        candidates.append(text[match.start():])
+    for candidate in reversed(candidates):
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(candidate.lstrip())
+        except ValueError:
+            continue
+        items = payload.get("clarifications") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            continue
+        questions = []
+        for item in items:
+            question = item.get("question") if isinstance(item, dict) else item
+            if isinstance(question, str) and question.strip():
+                questions.append(question.strip())
+        if questions:
+            return questions[:MAX_CLARIFICATIONS]
+    return []
 
 
 def delegation_worker_state(delegation: dict[str, Any]) -> str:
@@ -236,14 +267,22 @@ def _execute(config: ClodexConfig, state: StateStore, run_id: str, delegation: d
         return _audit(config, state, run_id, delegation, run, runner, artifacts, workspace, instructions, task)
 
     fixes = open_fixes(data, config.reviewers) if mode == "fix" else None
-    prompt = delegate_prompt(mode, task, instructions, fixes)
+    answered = state.answered_clarifications(run_id)
+    prompt = delegate_prompt(mode, task, instructions, fixes, [(item["question"], item["answer"]) for item in answered])
     result = runner.run(codex_exec_command(config, workspace, approval_profile=delegation.get("approval_profile")), prompt)
     report_path = artifacts.write_text(f"delegation-{delegation['id']}-codex.md", _report_text(result.stdout, result.stderr))
     if not result.ok:
         raise RuntimeError(f"codex exited with code {result.returncode}: {(result.stderr or result.stdout).strip()[:500]}")
     diff, diff_hash = _prepare_diff(workspace, config.repo_root)
     diff_path = artifacts.write_text("changes.diff", diff, exact=True)
+    if answered:
+        state.mark_delivered([int(item["id"]) for item in answered])  # Codex has now seen them
     summary = result.stdout.strip() or "(codex printed no report)"
+    questions = extract_clarifications(result.stdout)
+    for question in questions:  # before the handoff update: that may block the handoff, which then takes no messages
+        state.add_clarification(run_id, "codex", question)
+    if questions and not diff.strip():
+        summary = "Codex needs clarification: " + "; ".join(questions)
     state.update_handoff(
         run_id,
         phase="implementation" if mode == "implement" else "fix",
@@ -253,6 +292,7 @@ def _execute(config: ClodexConfig, state: StateStore, run_id: str, delegation: d
         report={
             "summary": summary[:SUMMARY_LIMIT],
             "changed": bool(diff.strip()),
+            **({"clarifications": questions} if questions else {}),
             "delegation": delegation["id"],
             "mode": mode,
             "artifacts": [str(report_path), str(diff_path)],

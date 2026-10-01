@@ -84,6 +84,7 @@ class FakeCliPath:
         codex_logged_in: bool = True,
         codex_catalog: dict | None = None,
         codex_fails: bool = False,
+        codex_clarifies: bool = False,
     ):
         self.reject_once = reject_once
         self.malformed_once = malformed_once
@@ -98,6 +99,7 @@ class FakeCliPath:
         self.codex_logged_in = codex_logged_in
         self.codex_catalog = codex_catalog
         self.codex_fails = codex_fails
+        self.codex_clarifies = codex_clarifies
         self.sleep_seconds = sleep_seconds
         self.include_clodex = include_clodex
 
@@ -320,6 +322,9 @@ if name == 'codex':
         print(text)
         raise SystemExit(0)
 
+    if {self.codex_clarifies!r} and 'adversarial auditor' not in stdin and 'Clarifications from Claude' not in stdin:
+        # Ask instead of guessing, until the answers show up in the prompt.
+        finish('I cannot proceed without a decision.\\n\\n' + json.dumps({{'clarifications': ['Which database should be used?', {{'question': 'Must it stay backwards compatible?'}}]}}))
     if 'adversarial auditor' in stdin:
         finish(audit_verdict(True, 'ok', []))
     if 'Required fixes' in stdin:

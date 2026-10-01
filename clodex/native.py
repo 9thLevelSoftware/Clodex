@@ -53,7 +53,7 @@ Codex is the default engineer for implementation, fixes, and focused audit work.
 When a user asks for non-trivial design, implementation, debugging, refactoring, or review work:
 
 1. Prefer the MCP tool `clodex_handoff_create` to create or resume a durable handoff. Pass `workspace: "git-worktree"` so Codex works in an isolated checkout.
-2. Use `clodex_handoff_get` before acting on an existing handoff; it shows the budget, the next expected actor, and any running delegation.
+2. Use `clodex_handoff_get` before acting on an existing handoff; it shows the budget, the next expected actor, any running delegation, and `open_clarifications`. Answer questions Codex asked with `clodex_answer`, then delegate again: answers are included in Codex's next prompt.
 3. Produce the plan, design, acceptance criteria, risks, and test commands before implementation, and record them with `clodex_handoff_update`.
 4. Delegate implementation to Codex with `clodex_delegate` (mode `implement`, `instructions` = the accepted plan) instead of telling the user to run Codex. Pass `wait: true`, or poll `clodex_handoff_get`.
 5. Review the diff in the handoff's workspace, then record your verdict with `clodex_handoff_update` (actor `claude`, the diff hash from `clodex_handoff_get`, `report.approved`, `report.required_fixes`).
@@ -94,7 +94,7 @@ When Clodex context is present:
 4. Use `clodex_handoff_update` to record changed files, tests run, unresolved issues, audit verdicts, and diff hash.
 5. Use `clodex_handoff_create` only when the user asks Codex to start a native collaboration directly.
 6. Use `clodex_handoff_decide` before claiming completion after implementation or audit work.
-7. Ask for clarification through Clodex when product intent or acceptance criteria are unclear.
+7. Ask for clarification with `clodex_clarify` instead of guessing when product intent or acceptance criteria are unclear (when Clodex runs you for a delegation, end your final message with a JSON object `{{"clarifications": ["..."]}}` instead).
 8. Respect owner, phase, and handoff budget state. When the budget is exhausted, summarize the disagreement for the user.
 9. When Clodex delegates work to you it runs `codex exec` in the handoff's workspace and records your result itself, so you do not need to call the handoff tools in that case; just do the work and finish with a concise report.
 

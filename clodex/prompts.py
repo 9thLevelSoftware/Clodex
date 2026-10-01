@@ -110,7 +110,7 @@ def audit_diff_excerpt(diff: str, max_bytes: int) -> str:
     )
 
 
-def delegate_prompt(mode: str, task: str, instructions: str | None, fixes: list[str] | None = None) -> str:
+def delegate_prompt(mode: str, task: str, instructions: str | None, fixes: list[str] | None = None, answers: list[tuple[str, str]] | None = None) -> str:
     """The prompt for a Codex job a native handoff delegated (implement or fix)."""
     lines = [
         "You are the Codex engineering wave for Clodex, working a native Claude/Codex handoff.",
@@ -123,11 +123,19 @@ def delegate_prompt(mode: str, task: str, instructions: str | None, fixes: list[
     ]
     if instructions:
         lines += ["", "Instructions from Claude:", instructions]
+    if answers:
+        lines += ["", "Clarifications from Claude (your earlier questions, now answered):"]
+        for question, answer in answers:
+            lines += [f"- Q: {question}", f"  A: {answer}"]
     if mode == "fix":
         lines += ["", "Required fixes:", json.dumps(fixes or ["Resolve the open review findings."], indent=2), "", "Apply only the required fixes. Do not broaden scope."]
     lines += [
         "",
-        "When finished, print a concise Markdown report with:",
+        "If you cannot proceed without a decision from Claude (product intent or acceptance criteria are unclear), "
+        "do not guess: stop and end your final message with a single JSON object "
+        '{"clarifications": ["one specific question", "..."]} and nothing after it.',
+        "",
+        "Otherwise, when finished, print a concise Markdown report with:",
         "- files changed",
         "- tests run and pass/fail status",
         "- unresolved issues, if any",

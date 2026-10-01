@@ -17,6 +17,7 @@ from .config import resolve_repo_root
 from .delegate import DelegationManager, WaitAborted
 from .quorum import evaluate_handoff, resolve_reviewer
 from .schemas import validate as validate_schema
+from .state import TERMINAL_STATUSES
 from .tasks import TaskManager
 from .workflow import ClodexWorkflow
 from .workspace import DirtyWorkspaceError, WorkspaceManager
@@ -162,6 +163,40 @@ TOOLS = [
                 "instructions": {"type": "string"},
                 "approval_profile": {"type": "string", "enum": ["ci", "local", "auto_review"]},
                 "wait": {"type": "boolean"},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "clodex_clarify",
+        "title": "Ask a clarifying question",
+        "description": "Ask the other agent a question about a handoff instead of guessing. It stays open (and blocks approval) until answered with clodex_answer; answers are given to Codex in its next delegation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}, "actor": {"type": "string", "enum": ["claude", "codex"]}, "question": {"type": "string"}},
+            "required": ["run_id", "actor", "question"],
+        },
+    },
+    {
+        "name": "clodex_answer",
+        "title": "Answer a clarifying question",
+        "description": "Answer an open clarification (by message_id, as listed by clodex_handoff_get or clodex_messages). The asker's agent cannot answer its own question.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}, "message_id": {"type": "integer"}, "answer": {"type": "string"}, "actor": {"type": "string", "enum": ["claude", "codex"]}},
+            "required": ["run_id", "message_id", "answer", "actor"],
+        },
+    },
+    {
+        "name": "clodex_messages",
+        "title": "List handoff messages",
+        "description": "List a handoff's clarification messages, optionally filtered by status (open, answered, delivered, final) or kind (clarification, answer).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["open", "answered", "delivered", "final"]},
+                "kind": {"type": "string", "enum": ["clarification", "answer"]},
             },
             "required": ["run_id"],
         },
@@ -618,6 +653,26 @@ def tool_call(name: str, arguments: dict[str, Any], should_stop: Callable[[], bo
         except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
             return call_text(expected_handoff_error(exc), is_error=True)
         return call_json(run, is_error=run.get("status") == "blocked")
+    elif name == "clodex_clarify":
+        try:
+            message = workflow.state.add_clarification(str(arguments["run_id"]), str(arguments["actor"]), str(arguments["question"]))
+        except ValueError as exc:
+            return call_text(str(exc), is_error=True)
+        return call_json(message)
+    elif name == "clodex_answer":
+        try:
+            message = workflow.state.answer_clarification(str(arguments["run_id"]), int(arguments["message_id"]), str(arguments["answer"]), str(arguments["actor"]))
+        except ValueError as exc:
+            return call_text(str(exc), is_error=True)
+        return call_json(message)
+    elif name == "clodex_messages":
+        run_id = str(arguments["run_id"])
+        if workflow.state.get_run(run_id) is None:
+            return call_text(f"Unknown run: {run_id}", is_error=True)
+        try:
+            return call_json({"messages": workflow.state.list_messages(run_id, arguments.get("status"), arguments.get("kind"))})
+        except ValueError as exc:
+            return call_text(str(exc), is_error=True)
     elif name == "clodex_delegate":
         manager = DelegationManager(root)
         try:
@@ -652,8 +707,11 @@ def tool_call(name: str, arguments: dict[str, Any], should_stop: Callable[[], bo
         if data is None:
             return call_text(f"Unknown run: {run_id}", is_error=True)
 
+        DelegationManager(root).reconcile_active(run_id)
         run = data["run"]
         status = run.get("status")
+        if status not in TERMINAL_STATUSES and workflow.state.active_delegation(run_id) is not None:
+            return call_text("a delegation is still running for this handoff; wait for it to finish before deciding", is_error=True)
         agreement = evaluate_handoff(data, workflow.config.reviewers, workflow.config.audit.get("quorum", "unanimous"))
         if status == "approved":
             decision = {"decision": "approved", "run_id": run["id"], "diff_hash": run.get("diff_hash")}
@@ -666,6 +724,19 @@ def tool_call(name: str, arguments: dict[str, Any], should_stop: Callable[[], bo
                 "blocked_reason": run.get("blocked_reason") or run.get("error"),
             }
             is_error = True
+        elif data["open_clarifications"]:
+            # Reviewers may agree, but a question nobody has answered means the work is not settled.
+            decision = {
+                "decision": "needs_fix",
+                "run_id": run["id"],
+                "reason": "open clarifications must be answered first",
+                "open_clarifications": [{"message_id": m["id"], "asked_by": m["actor"], "question": m["body"]} for m in data["open_clarifications"]],
+                "next_expected_actor": data["next_expected_actor"],
+                "required_pending": agreement["required_pending"],
+                "approved_reviewers": agreement["approved_reviewers"],
+                "quorum": agreement["quorum"],
+            }
+            is_error = False
         elif agreement["approved"]:
             try:
                 approved_run = workflow.state.approve_handoff(run["id"], agreement["diff_hash"], approved_by=agreement["approved_by"])

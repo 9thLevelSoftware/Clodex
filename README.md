@@ -83,6 +83,9 @@ Native coordination uses these MCP tools:
 - `clodex_handoff_get`
 - `clodex_handoff_decide`
 - `clodex_delegate`
+- `clodex_clarify`
+- `clodex_answer`
+- `clodex_messages`
 
 If MCP is unavailable, use the CLI fallbacks:
 
@@ -348,6 +351,21 @@ non-interactive `codex exec` has no MCP access to report for itself:
   the actor (`claude` / `codex`) stands for the first *required* reviewer of that backend, so the
   default two-reviewer flow needs no extra fields. An unknown `reviewer_id` is rejected. The
   decision lists `required_pending` and `approved_reviewers` so the orchestrator knows whom to ask.
+- **Clarifications.** Either agent can ask the other a question instead of guessing:
+  `clodex_clarify` (`run_id`, `actor`, `question`) opens it, `clodex_answer` (`run_id`,
+  `message_id`, `answer`, `actor`; the asker cannot answer its own question) closes it, and
+  `clodex_messages` lists them (`status`: open / answered / delivered). While a question is open
+  `clodex_handoff_get` shows it under `open_clarifications` and the turn passes to whoever must
+  answer, and `clodex_handoff_decide` returns `needs_fix` even if the reviewers agree. When
+  Codex is run by `clodex_delegate` it is told to end its final message with
+  `{"clarifications": ["..."]}` instead of guessing; the worker posts those as questions, and the
+  answers are put into Codex's next delegation prompt (then marked `delivered`). A question
+  handed back counts as a handoff against the budget.
+- **Guards.** `clodex_handoff_decide` refuses while a delegation is still running, so you never
+  decide on a diff that is changing. `actor` and `owner` must be `claude` or `codex` (case is
+  normalized); anything else is rejected rather than recorded. Turns are *not* strictly
+  alternated: an orchestrator legitimately records several updates in a row, so only the worker's
+  own handoffs spend budget automatically (interactive agents still pass `increment_handoff`).
 - **Workspaces.** `clodex_handoff_create` takes `workspace: "git-worktree" | "local" | "none"`
   (default `none`). A worktree is an isolated checkout under `.clodex/workspaces/<run-id>` (the
   repo must have no uncommitted changes to tracked files); if the handoff cannot be recorded the
