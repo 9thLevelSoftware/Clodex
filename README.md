@@ -104,6 +104,8 @@ clodex status
 | Git | diff hashing and repository state |
 | Claude Code CLI | planning and Claude audit |
 | Codex CLI | implementation and Codex audit |
+| Node 18+ (optional) | the npm launcher and the Claude Code plugin's MCP server |
+| PyYAML (bundled) | parses `CLODEX.md`; pip installs depend on it, npm installs ship a vendored copy |
 
 Subscription CLI auth is the default:
 
@@ -171,7 +173,7 @@ PowerShell:
 | `clodex task start/get/cancel/list` | Manage durable async runs |
 | `clodex trace export <run-id>` | Print a run trace as JSONL |
 | `clodex hooks print/install/uninstall/ingest` | Manage the Claude Code hook integration (`install --scope local\|project\|user`) |
-| `clodex eval run` | Run local harness smoke evals |
+| `clodex eval run` | Offline self-test of the harness (config, command lines, schemas, state, worktrees, native setup, hooks); calls no agents and writes nothing to your repo |
 | `clodex queue add/list/update` | Manage the local task ledger |
 | `clodex status` | Show recent tasks and runs |
 | `clodex mcp-server` | Run the stdio MCP server |
@@ -197,7 +199,7 @@ codex:
   approval_profile: ci
 workspace:
   backend: git-worktree
-  apply_mode: manual
+  apply_mode: manual   # auto: apply an approved worktree build to your checkout automatically
 max_fix_loops: 2
 ```
 
@@ -307,7 +309,8 @@ The server speaks MCP `2025-11-25` (and negotiates down to `2025-06-18`, `2025-0
   `queued`/`running`/`planning`/`auditing`/`needs-fix` = `working`, `approved`/`applied` =
   `completed`, `blocked`/`failed` = `failed`, `cancelled` = `cancelled`. Task ids are not
   access-controlled: this is a local, single-user server, so only expose it to clients you trust.
-  The pre-spec `tasks/update` method is gone.
+  The pre-spec `tasks/update` method is gone. Set `mcp.async_tasks: false` in `CLODEX.md` to
+  turn tasks (and `clodex_task_start`) off.
 - `clodex_audit` accepts `base` (everything since that ref diverged) and `commit` (one commit) as
   well as the default uncommitted diff.
 

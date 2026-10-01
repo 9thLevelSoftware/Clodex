@@ -240,6 +240,8 @@ def validate(config: Any, catalog: dict[str, dict[str, Any]] | None = None, on: 
         found.append(Diagnostic("error", "codex.sandbox", f"unknown sandbox '{codex.get('sandbox')}'", "use read-only, workspace-write or danger-full-access"))
     if str(codex.get("approval_profile")) not in {"ci", "local", "auto_review"}:
         found.append(Diagnostic("error", "codex.approval_profile", f"unknown approval profile '{codex.get('approval_profile')}'", "use ci, local or auto_review"))
+    if str(config.workspace.get("apply_mode", "manual")) not in {"manual", "auto"}:
+        found.append(Diagnostic("error", "workspace.apply_mode", f"unknown apply mode '{config.workspace.get('apply_mode')}'", "use manual or auto"))
     if str(config.workspace.get("backend")) not in {"git-worktree", "local"}:
         found.append(Diagnostic("error", "workspace.backend", f"unknown workspace backend '{config.workspace.get('backend')}'", "use git-worktree or local"))
 

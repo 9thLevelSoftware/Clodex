@@ -1,6 +1,6 @@
 {
   "name": "clodex",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Native Claude Code and Codex collaboration for local-first agent workflows",
   "license": "UNLICENSED",
   "repository": {
@@ -38,6 +38,7 @@
     "dist",
     "CLODEX.md",
     "README.md",
+    "CHANGELOG.md",
     "pyproject.toml"
   ],
   "engines": {

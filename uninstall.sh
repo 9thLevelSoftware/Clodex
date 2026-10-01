@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="0.1.1"
+SCRIPT_VERSION="0.2.0"
 TARGET_DIR="$HOME/.clodex"
 BIN_DIR="$HOME/.local/bin"
 DRY_RUN=false
