@@ -99,7 +99,7 @@ def codex_exec_command(config: ClodexConfig, repo_root: Path, approval_profile: 
     else:
         # `codex exec` is non-interactive and has no --ask-for-approval flag.
         argv.extend(["-c", 'approval_policy="never"'])
-    argv.extend(["--sandbox", str(codex["sandbox"]), "-C", str(repo_root), "-"])
+    argv.extend(["--sandbox", str(codex["sandbox"]), "-C", str(repo_root), "--skip-git-repo-check", "-"])
     return AgentCommand(name="codex-build", argv=argv)
 
 
@@ -127,7 +127,7 @@ def codex_review_command(config: ClodexConfig, repo_root: Path) -> AgentCommand:
     # parsed, and the reply is validated against the schema either way.
     if capabilities.supports(config.repo_root, "codex", "--output-schema") is not False:
         argv.extend(["--output-schema", str(schema_path("audit_verdict"))])
-    argv.append("-")
+    argv.extend(["--skip-git-repo-check", "-"])
     return AgentCommand(
         name="codex-audit",
         argv=argv,
